@@ -1,0 +1,1257 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Camera Manager</title>
+    <style>
+        
+:root {
+    --primary-color: #1b263b;
+    --danger-color: #f44336;
+    --success-color: #4CAF50;
+    --sidebar-width: 300px;
+    --header-height: 60px;
+}
+
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    font-family: Arial, sans-serif;
+    background: #0d1b2a;
+    min-height: 100vh;
+}
+
+.header {
+    position: fixed;
+    top: 10px;
+    left: 10px;
+    right: 10px;
+    height: var(--header-height);
+    background: var(--primary-color);
+    color: #e0e1dd;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 0 20px;
+    z-index: 100;
+    border-radius: 10px;
+}
+
+.header-left {
+    display: flex;
+    align-items: center;
+    gap: 15px;
+}
+
+.header-title {
+    display: flex;
+    align-items: center;
+    gap: 20px;
+}
+
+.header-right {
+    display: flex;
+    align-items: center;
+    gap: 15px;
+}
+
+.camera-count {
+    background: #1b263b;
+    color: #e0e1dd;
+    padding: 8px 15px;
+    border-radius: 20px;
+    font-size: 0.9em;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.sidebar {
+    position: fixed;
+    left: 10px;
+    top: 80px;
+    bottom: 10px;
+    width: var(--sidebar-width);
+    background: #1b263b;
+    padding: 20px;
+    box-shadow: 2px 0 4px rgba(0,0,0,0.1);
+    transform: translateX(-100%);
+    transition: transform 0.3s ease;
+    z-index: 99;
+    overflow-y: auto;
+    border-radius: 10px;
+    
+}
+
+.sidebar.open {
+    transform: translateX(0);
+}
+
+.main-content {
+    margin-top: var(--header-height);
+    padding: 20px;
+    transition: margin-left 0.3s ease;
+}
+
+.main-content.sidebar-open {
+    margin-left: var(--sidebar-width);
+}
+
+.camera-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(640px, 1fr));
+    gap: 24px;
+    padding: 24px;
+    max-width: none;
+    margin: 0 auto;
+}
+
+.camera-container {
+    background: #e0e1dd;
+    border-radius: 12px;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.12);
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    position: relative;
+    min-width: 640px;
+    min-height: 480px;
+    width: 640px;
+    height: 480px;
+    transition: box-shadow 0.3s ease;
+    border: 1px solid rgba(0,0,0,0.08);
+}
+
+.camera-container:hover {
+    box-shadow: 0 12px 32px rgba(0,0,0,0.16);
+}
+
+.camera-header {
+    padding: 15px 20px;
+    background: #f8f9fa;
+    border-bottom: 1px solid rgba(0,0,0,0.08);
+}
+
+.camera-header h1 {
+    font-size: 1.1rem;
+    color: #1a1a1a;
+    font-weight: 600;
+}
+
+.camera-stream-wrapper {
+    position: relative;
+    flex: 1;
+    background: #000;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+    min-height: 360px;
+}
+
+.camera-stream {
+    position: absolute;
+    max-width: 100%;
+    max-height: 100%;
+    width: auto;
+    height: auto;
+    object-fit: contain;
+}
+
+.camera-controls {
+    padding: 12px 20px;
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 12px;
+    background: #fff;
+    border-top: 1px solid rgba(0,0,0,0.08);
+}
+
+.btn {
+    padding: 10px 16px;
+    border: none;
+    border-radius: 6px;
+    cursor: pointer;
+    color: #e0e1dd !important;
+    font-weight: 600;
+    transition: all 0.3s ease;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    min-width: 120px;
+}
+
+.btn:hover {
+    transform: translateY(-1px);
+    opacity: 0.95;
+}
+
+.btn:active {
+    transform: translateY(0);
+}
+
+.btn-record {
+    transition: all 0.3s ease !important;
+    position: relative;
+}
+
+.btn-record:disabled::after {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: rgba(0, 0, 0, 0.2);
+    border-radius: 6px;
+}
+
+.btn-record:not(.recording) {
+    background-color: var(--success-color) !important;
+}
+
+.btn-record.recording {
+    background-color: var(--danger-color) !important;
+}
+
+.btn-remove { background: #607D8B; }
+
+.metrics {
+    padding: 12px 20px;
+    font-size: 0.9em;
+    color: #666;
+    background: #f8f9fa;
+    border-top: 1px solid rgba(0,0,0,0.08);
+}
+
+.add-camera-form {
+    background: #1b263b;
+    padding: 10px;
+    border-radius: 8px;
+}
+
+.form-group {
+    margin-bottom: 15px;
+}
+
+.add-camera-title-header {
+    display: flex;
+    justify-content: center;
+    margin-bottom: 20px;
+    color: #e0e1dd;
+    font-weight: normal;
+    align-items: center;
+    gap: 10px;
+}
+
+.add-camera-title {
+    color: #e0e1dd;
+    font-weight: normal;
+    display: flex;
+    justify-content: center;
+    margin-bottom: 20px;
+}
+
+.instructions {
+    color: #e0e1dd;
+    font-weight: normal;
+    margin-bottom: 20px;
+}
+
+.form-group label {
+    display: block;
+    margin-bottom: 5px;
+    font-weight: normal;
+    color: #e0e1dd;
+}
+
+.form-group input {
+    width: 100%;
+    padding: 10px;
+    border: 1px solid #ddd;
+    border-radius: 4px;
+}
+
+.error-message {
+    background: #fff3f3;
+    color: var(--danger-color);
+    padding: 12px 20px;
+    margin: 0;
+    border-top: 1px solid rgba(244, 67, 54, 0.1);
+    font-size: 0.9em;
+    display: none;
+}
+
+.toggle-btn {
+    background: #1565C0;
+    color: #e0e1dd;
+    border: none;
+    padding: 8px 20px;
+    border-radius: 10px;
+    cursor: pointer;
+    font-weight: bold;
+    font-size: medium;
+    transition: background-color 0.2s;
+}
+
+.toggle-btn:hover {
+    background: #0da121;
+}
+
+.resize-handle {
+    position: absolute;
+    bottom: 0;
+    right: 0;
+    width: 16px;
+    height: 16px;
+    cursor: se-resize;
+    background: linear-gradient(135deg, transparent 50%, var(--primary-color) 50%);
+    z-index: 10;
+    opacity: 0.6;
+    transition: opacity 0.2s;
+}
+
+.resize-handle:hover {
+    opacity: 1;
+}
+
+@media (max-width: 768px) {
+    .camera-grid {
+        grid-template-columns: 1fr;
+        padding: 12px;
+    }
+
+    .camera-container {
+        min-width: 320px;
+        width: 100%;
+        height: auto;
+    }
+}
+
+@media (min-width: 1920px) {
+    .camera-grid {
+        grid-template-columns: repeat(auto-fit, minmax(640px, 1fr));
+    }
+}
+
+.btn i {
+    margin-right: 8px;
+}
+
+@media (max-width: 768px) {
+    :root {
+        --header-height: 50px;
+        --sidebar-width: 100%;
+    }
+
+    .header {
+        top: 0;
+        left: 0;
+        right: 0;
+        border-radius: 0;
+        padding: 0 10px;
+    }
+
+    .header h1 {
+        font-size: 1rem;
+        margin: 0 10px;
+    }
+
+    .toggle-btn {
+        padding: 6px 12px;
+        font-size: 0.9rem;
+        white-space: nowrap;
+    }
+
+    .sidebar {
+        top: var(--header-height);
+        width: 100%;
+        padding: 15px;
+    }
+
+    .main-content {
+        padding: 10px;
+        margin-top: var(--header-height);
+    }
+
+    .camera-grid {
+        grid-template-columns: 1fr;
+        gap: 12px;
+        padding: 12px 10px;
+    }
+
+    .camera-container {
+        min-width: 100%;
+        width: 100%;
+        height: auto;
+        min-height: 300px;
+        border-radius: 8px;
+    }
+
+    .camera-header {
+        padding: 10px 15px;
+    }
+
+    .camera-header h3 {
+        font-size: 1rem;
+    }
+
+    .camera-controls {
+        grid-template-columns: 1fr;
+        gap: 8px;
+        padding: 10px 15px;
+    }
+
+    .btn {
+        padding: 8px 12px;
+        font-size: 0.9rem;
+    }
+
+    .metrics {
+        padding: 10px 15px;
+        font-size: 0.8rem;
+    }
+
+    .resize-handle {
+        width: 12px;
+        height: 12px;
+    }
+
+    /* Mobile-specific touch improvements */
+    button {
+        min-width: 44px;
+        min-height: 44px;
+    }
+
+    .camera-stream-wrapper {
+        min-height: 250px;
+    }
+
+    .add-camera-form {
+        padding: 15px;
+    }
+
+    .form-group input {
+        padding: 10px;
+    }
+}
+
+/* Additional mobile-first improvements */
+@media (hover: none) {
+    .btn:hover {
+        transform: none;
+        opacity: 1;
+    }
+    
+    .camera-container:hover {
+        box-shadow: 0 8px 24px rgba(0,0,0,0.12);
+    }
+}
+
+/* Ensure proper viewport scaling */
+@viewport {
+    width: device-width;
+    zoom: 1.0;
+}
+
+/* Toast notification styles */
+.toast-container {
+    position: fixed;
+    top: 20px;
+    right: 20px;
+    z-index: 1000;
+}
+
+.toast {
+    background-color: #333;
+    color: #fff;
+    padding: 15px 25px;
+    border-radius: 5px;
+    margin-bottom: 10px;
+    min-width: 250px;
+    max-width: 500px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+    animation: slideIn 0.3s ease-in-out;
+}
+
+.toast.success {
+    background-color: #4CAF50;
+    border-left: 5px solid #2E7D32;
+}
+
+.toast.error {
+    background-color: #f44336;
+    border-left: 5px solid #c62828;
+}
+
+.toast.warning {
+    background-color: #ff9800;
+    border-left: 5px solid #ef6c00;
+}
+
+.toast .message {
+    margin-right: 10px;
+    flex-grow: 1;
+}
+
+.toast .close-btn {
+    background: none;
+    border: none;
+    color: white;
+    cursor: pointer;
+    font-size: 18px;
+    padding: 0 5px;
+}
+
+@keyframes slideIn {
+    from {
+        transform: translateX(100%);
+        opacity: 0;
+    }
+    to {
+        transform: translateX(0);
+        opacity: 1;
+    }
+}
+
+@keyframes slideOut {
+    from {
+        transform: translateX(0);
+        opacity: 1;
+    }
+    to {
+        transform: translateX(100%);
+        opacity: 0;
+    }
+}
+
+.initialization-overlay {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: rgba(0, 0, 0, 0.7);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    color: white;
+    z-index: 10;
+}
+
+.initialization-spinner {
+    border: 4px solid #f3f3f3;
+    border-top: 4px solid #3498db;
+    border-radius: 50%;
+    width: 40px;
+    height: 40px;
+    animation: spin 1s linear infinite;
+    margin-bottom: 10px;
+}
+
+@keyframes spin {
+    0% { transform: rotate(0deg); }
+    100% { transform: rotate(360deg); }
+}
+
+@keyframes fadeOut {
+    from { opacity: 1; }
+    to { opacity: 0; }
+}
+
+.btn:disabled {
+    opacity: 0.7;
+    cursor: not-allowed;
+    pointer-events: none;
+}
+
+.history-sidebar {
+    position: fixed;
+    right: -300px;
+    top: 80px;
+    bottom: 10px;
+    width: 300px;
+    background: #1b263b;
+    padding: 20px;
+    transition: right 0.3s ease;
+    z-index: 98;
+    border-radius: 10px;
+    color: white;
+    box-shadow: -2px 0 5px rgba(0,0,0,0.2);
+}
+
+.history-sidebar.open {
+    right: 10px;
+}
+
+.history-item {
+    background: #2c3e50;
+    padding: 12px;
+    margin: 8px 0;
+    border-radius: 6px;
+    cursor: pointer;
+    transition: transform 0.2s ease;
+}
+
+.history-item:hover {
+    transform: translateX(-5px);
+    background: #34495e;
+}
+
+.history-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 15px;
+}
+    </style>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+</head>
+<body>
+    <div class="header">
+        <div class="header-left">
+            
+            <div class="header-title">
+                <h1>Multi-Camera Manager</h1>
+                <div class="camera-count">
+                    <i class="fas fa-video"></i>
+                    <span id="cameraCount">0</span> Cameras
+                </div>
+            </div>
+        </div>
+        <div class="header-right">
+            <button class="toggle-btn" onclick="toggleHistory()">
+                <i class="fas fa-history"></i> History
+            </button>
+                <button class="toggle-btn" onclick="toggleSidebar()">☰ Add Camera</button>
+        </div>
+    </div>
+
+    <div class="sidebar">
+        <div class="add-camera-form">
+            <div class="add-camera-title-header">
+                <i class="fas fa-camera icon"></i>
+                <h3> Add New Camera </h3>
+            </div>
+            <form id="addCameraForm" onsubmit="return false;">
+                <div class="form-group">
+                    <label for="newCameraSource">Camera Source:</label>
+                    <input type="text" id="newCameraSource" placeholder="Enter camera index or URL" required>
+                </div>
+                <div class="form-group">
+                    <label for="newCameraName">Camera Name:</label>
+                    <input type="text" id="newCameraName" placeholder="Enter camera name">
+                </div>
+                <div class="form-group">
+                    <label for="newCameraFPS">Max FPS:</label>
+                    <input type="number" id="newCameraFPS" value="20" min="1" max="60">
+                </div>
+                <button class="btn btn-record" onclick="addCamera()">Add Camera</button>
+            </form>
+        </div>
+    </div>
+
+    <div class="main-content">
+        <div id="cameras" class="camera-grid"></div>
+    </div>
+    <div class="toast-container" id="toastContainer"></div>
+    <div class="history-sidebar">
+        <div class="history-header">
+            <h3>Connection History</h3>
+            <button class="toggle-btn" onclick="clearHistory()">
+                <i class="fas fa-trash"></i>
+            </button>
+        </div>
+        <div class="history-list" id="history-list"></div>
+    </div>
+    <script>
+    // Get the current hostname or IP address
+    const currentHost = window.location.hostname;
+    const currentPort = window.location.port;
+    
+    // Use this to create WebSocket URLs
+    function getWebSocketUrl(camera_id) {
+        // Use wss:// for https, ws:// for http
+        const protocol = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
+        return `${protocol}${currentHost}:${currentPort}/stream/${camera_id}`;
+    }
+    
+    // Use this function when creating WebSocket connections
+    // const ws = new WebSocket(getWebSocketUrl(camera_id));
+
+    const websockets = new Map();
+    const canvasContexts = new Map();
+    const activePolling = new Map();  // Track if polling should continue for each camera
+
+    let cameraCount = 0;
+
+    function updateCameraCount() {
+        const countElement = document.getElementById('cameraCount');
+        countElement.textContent = cameraCount;
+    }
+
+    function toggleSidebar() {
+        document.querySelector('.sidebar').classList.toggle('open');
+        document.querySelector('.main-content').classList.toggle('sidebar-open');
+    }
+
+    function showToast(message, type = 'info') {
+        const toastContainer = document.querySelector('.toast-container') || createToastContainer();
+        const toast = document.createElement('div');
+        toast.className = `toast ${type}`;
+        toast.innerHTML = `
+            <span class="message">${message}</span>
+            <button class="close-btn" onclick="this.parentElement.remove()">&times;</button>
+        `;
+        toastContainer.appendChild(toast);
+        
+        setTimeout(() => {
+            toast.style.animation = 'slideOut 0.3s ease-in-out forwards';
+            setTimeout(() => toast.remove(), 300);
+        }, 5000);
+    }
+
+    function createToastContainer() {
+        const container = document.createElement('div');
+        container.className = 'toast-container';
+        document.body.appendChild(container);
+        return container;
+    }
+
+    async function addCamera() {
+        const source = document.getElementById('newCameraSource').value;
+        const name = document.getElementById('newCameraName').value || `Camera ${cameraCount + 1}`;
+        const fps = document.getElementById('newCameraFPS').value;
+
+        if (!source) {
+            showToast('Camera source is required', 'error');
+            return;
+        }
+
+        try {
+            const response = await fetch('/add_camera', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ 
+                    source: isNaN(source) ? source : parseInt(source),
+                    name: name,
+                    max_fps: parseInt(fps)
+                })
+            });
+            
+            const data = await response.json();
+            if (data.status === 'success') {
+                saveCameraToHistory(source, name);
+                createCameraElement(data.camera_id, name);
+                initializeStream(data.camera_id);
+                showToast(`Camera "${name}" added successfully`, 'success');
+                // Clear the form
+                document.getElementById('newCameraSource').value = '';
+                document.getElementById('newCameraName').value = '';
+                document.getElementById('newCameraFPS').value = '20';
+            } else {
+                showToast(data.message || 'Failed to add camera', 'error');
+            }
+        } catch (error) {
+            console.error('Failed to add camera:', error);
+            showToast('Failed to add camera: Network error', 'error');
+        }
+    }
+
+    // Add a map to store interval IDs
+    const statusPollingIntervals = new Map();
+
+    function createCameraElement(cameraId, name) {
+        const camerasDiv = document.getElementById('cameras');
+        const cameraHtml = `
+            <div class="camera-container" id="camera-${cameraId}">
+                <div class="initialization-overlay" id="init-overlay-${cameraId}">
+                    <div class="initialization-spinner"></div>
+                    <div id="init-countdown-${cameraId}">Initializing camera...</div>
+                </div>
+                <div class="camera-header">
+                    <h3>${name} (ID: ${cameraId})</h3>
+                </div>
+                <div class="camera-stream-wrapper">
+                    <canvas id="stream-${cameraId}" class="camera-stream"></canvas>
+                </div>
+                <div class="error-message" id="error-${cameraId}"></div>
+                <div class="camera-controls">
+                    <button class="btn btn-record" id="record-btn-${cameraId}" onclick="toggleRecording(${cameraId})">
+                        <i class="fas fa-circle"></i>
+                        <span>Start Recording</span>
+                    </button>
+                    <button class="btn btn-remove" onclick="removeCamera(${cameraId})">
+                        <i class="fas fa-trash"></i>
+                        <span>Remove</span>
+                    </button>
+                </div>
+                <div class="metrics">
+                    <p>Status: <span id="status-${cameraId}">Active</span></p>
+                </div>
+                <div class="resize-handle"></div>
+            </div>
+        `;
+        camerasDiv.insertAdjacentHTML('beforeend', cameraHtml);
+        
+        initializeResizing(cameraId);
+        startInitializationCountdown(cameraId);
+        cameraCount++;
+        updateCameraCount();
+        
+        // Set active polling flag
+        activePolling.set(cameraId, true);
+        
+        // Start polling with check for active status
+        const intervalId = setInterval(() => {
+            if (!activePolling.get(cameraId)) {
+                clearInterval(intervalId);
+                statusPollingIntervals.delete(cameraId);
+                return;
+            }
+            updateRecordingStatus(cameraId);
+        }, 5000);
+        
+        statusPollingIntervals.set(cameraId, intervalId);
+    }
+
+    function adjustCanvasSize(canvas, containerWidth, containerHeight) {
+        if (!canvas || !containerWidth || !containerHeight) return;
+
+        const wrapper = canvas.closest('.camera-stream-wrapper');
+        if (!wrapper) return;
+
+        const wrapperWidth = wrapper.clientWidth;
+        const wrapperHeight = wrapper.clientHeight;
+        
+        // Maintain aspect ratio
+        const canvasAspectRatio = canvas.width / canvas.height;
+        const wrapperAspectRatio = wrapperWidth / wrapperHeight;
+        
+        let newWidth, newHeight;
+        
+        if (canvasAspectRatio > wrapperAspectRatio) {
+            // Canvas is wider than wrapper
+            newWidth = wrapperWidth;
+            newHeight = wrapperWidth / canvasAspectRatio;
+        } else {
+            // Canvas is taller than wrapper
+            newHeight = wrapperHeight;
+            newWidth = wrapperHeight * canvasAspectRatio;
+        }
+        
+        // Apply the new dimensions
+        canvas.style.width = `${newWidth}px`;
+        canvas.style.height = `${newHeight}px`;
+    }
+
+    function initializeStream(cameraId) {
+        const canvas = document.getElementById(`stream-${cameraId}`);
+        const ctx = canvas.getContext('2d');
+        canvasContexts.set(cameraId, ctx);
+
+        canvas.width = 640;
+        canvas.height = 480;
+
+        const ws = new WebSocket(getWebSocketUrl(cameraId));
+        websockets.set(cameraId, ws);
+
+        ws.onmessage = async function(event) {
+            const blob = event.data;
+            const img = new Image();
+            img.onload = () => {
+                canvas.width = img.width;
+                canvas.height = img.height;
+                ctx.drawImage(img, 0, 0);
+            };
+            img.src = URL.createObjectURL(new Blob([blob], { type: 'image/jpeg' }));
+        };
+
+        ws.onerror = function(error) {
+            showError(cameraId, 'Stream connection error');
+        };
+
+        ws.onclose = function() {
+            showError(cameraId, 'Stream connection closed');
+        };
+    }
+
+    async function removeCamera(cameraId) {
+        try {
+            if (!confirm('Are you sure you want to remove this camera?')) {
+                return;
+            }
+
+            // Stop polling immediately
+            activePolling.set(cameraId, false);
+
+            const response = await fetch(`/remove_camera/${cameraId}`, {
+                method: 'POST'
+            });
+            const data = await response.json();
+            
+            if (data.status === 'success') {
+                clearAllCameraResources(cameraId);
+                const element = document.getElementById(`camera-${cameraId}`);
+                if (element) {
+                    element.remove();
+                    showToast('Camera removed successfully', 'success');
+                    cameraCount--;
+                    updateCameraCount();
+                }
+            } else {
+                showToast(data.message || 'Failed to remove camera', 'error');
+                // Restore polling if removal failed
+                activePolling.set(cameraId, true);
+            }
+        } catch (error) {
+            console.error('Error removing camera:', error);
+            showToast('Failed to remove camera', 'error');
+            // Restore polling if removal failed
+            activePolling.set(cameraId, true);
+        }
+    }
+
+    // Add a helper function to clear all resources
+    function clearAllCameraResources(cameraId) {
+        // Stop polling first
+        activePolling.set(cameraId, false);
+        
+        // Clear status polling interval
+        const intervalId = statusPollingIntervals.get(cameraId);
+        if (intervalId) {
+            clearInterval(intervalId);
+            statusPollingIntervals.delete(cameraId);
+        }
+
+        // Clear WebSocket connection
+        if (websockets.has(cameraId)) {
+            const ws = websockets.get(cameraId);
+            ws.close();
+            websockets.delete(cameraId);
+        }
+
+        // Clear resize observer
+        if (resizeObservers.has(cameraId)) {
+            const observer = resizeObservers.get(cameraId);
+            observer.disconnect();
+            resizeObservers.delete(cameraId);
+        }
+
+        // Clear canvas context
+        if (canvasContexts.has(cameraId)) {
+            canvasContexts.delete(cameraId);
+        }
+
+        // Clean up polling flag
+        activePolling.delete(cameraId);
+    }
+
+    async function toggleRecording(cameraId) {
+        const button = document.querySelector(`#camera-${cameraId} .btn-record`);
+        if (button.disabled) return; // Prevent multiple clicks
+        
+        const isRecording = button.classList.contains('recording');
+        
+        try {
+            button.disabled = true; // Disable button during request
+            
+            const endpoint = isRecording ? '/stop_recording' : '/start_recording';
+            const response = await fetch(endpoint, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({ camera_id: cameraId })
+            });
+            
+            const data = await response.json();
+            
+            if (response.ok) {
+                updateRecordingButtonState(button, !isRecording);
+                showToast(data.message, 'success');
+            } else {
+                showToast(data.message || 'Recording operation failed', 'error');
+                // Revert button state if operation failed
+                updateRecordingButtonState(button, isRecording);
+            }
+        } catch (error) {
+            console.error('Error toggling recording:', error);
+            showToast('Failed to toggle recording', 'error');
+            // Revert button state on error
+            updateRecordingButtonState(button, isRecording);
+        } finally {
+            button.disabled = false; // Re-enable button
+        }
+    }
+
+    function showError(cameraId, message) {
+        const errorDiv = document.getElementById(`error-${cameraId}`);
+        errorDiv.textContent = message;
+        errorDiv.style.display = 'block';
+        setTimeout(() => {
+            errorDiv.style.display = 'none';
+        }, 5000);
+    }
+
+    // Load existing cameras on page load
+    async function loadExistingCameras() {
+        try {
+            const response = await fetch('/list_cameras');
+            const data = await response.json();
+            if (data.status === 'success') {
+                cameraCount = 0; // Reset count
+                data.cameras.forEach(camera => {
+                    createCameraElement(camera.id, camera.name);
+                    initializeStream(camera.id);
+                });
+                updateCameraCount();
+            }
+        } catch (error) {
+            console.error('Failed to load existing cameras:', error);
+            showToast('Failed to load existing cameras', 'error');
+        }
+    }
+
+    // Initialize on page load
+    document.addEventListener('DOMContentLoaded', () => {
+        loadExistingCameras();
+        handleResize();
+        displayHistory();
+    });
+
+    // Cleanup on page unload
+    window.addEventListener('beforeunload', () => {
+        websockets.forEach(ws => {
+            try {
+                ws.close();
+            } catch (e) {
+                console.error('Error closing websocket:', e);
+            }
+        });
+        resizeObservers.forEach(observer => {
+            try {
+                observer.disconnect();
+            } catch (e) {
+                console.error('Error disconnecting observer:', e);
+            }
+        });
+    });
+
+    // Handle window resize
+    function handleResize() {
+        // This can be removed if you want to rely solely on the ResizeObserver
+        // Or keep it for general layout adjustments
+    }
+
+    window.addEventListener('resize', handleResize);
+
+    // Add a map to store resize observers
+    const resizeObservers = new Map();
+
+    function initializeResizing(cameraId) {
+        const container = document.getElementById(`camera-${cameraId}`);
+        const handle = container.querySelector('.resize-handle');
+        const canvas = document.getElementById(`stream-${cameraId}`);
+        
+        let isResizing = false;
+        let startWidth, startHeight, startX, startY;
+        
+        handle.addEventListener('mousedown', initResize);
+        
+        function initResize(e) {
+            isResizing = true;
+            startX = e.clientX;
+            startY = e.clientY;
+            startWidth = container.offsetWidth;
+            startHeight = container.offsetHeight;
+            
+            document.addEventListener('mousemove', resize);
+            document.addEventListener('mouseup', stopResize);
+            
+            // Prevent text selection while resizing
+            document.body.style.userSelect = 'none';
+            // Add resizing class for visual feedback
+            container.classList.add('resizing');
+        }
+        
+        function resize(e) {
+            if (!isResizing) return;
+            
+            const newWidth = Math.max(640, startWidth + (e.clientX - startX));
+            const newHeight = Math.max(480, startHeight + (e.clientY - startY));
+            
+            container.style.width = `${newWidth}px`;
+            container.style.height = `${newHeight}px`;
+            
+            adjustCanvasSize(canvas, newWidth, newHeight);
+        }
+        
+        function stopResize() {
+            isResizing = false;
+            document.removeEventListener('mousemove', resize);
+            document.removeEventListener('mouseup', stopResize);
+            document.body.style.userSelect = '';
+            // Remove resizing class
+            container.classList.remove('resizing');
+        }
+        
+        // Store the observer in the map
+        const resizeObserver = new ResizeObserver(entries => {
+            for (let entry of entries) {
+                adjustCanvasSize(canvas, entry.contentRect.width, entry.contentRect.height);
+            }
+        });
+        
+        resizeObserver.observe(container);
+        resizeObservers.set(cameraId, resizeObserver);
+    }
+
+    function startInitializationCountdown(cameraId) {
+        const overlay = document.getElementById(`init-overlay-${cameraId}`);
+        const countdownElement = document.getElementById(`init-countdown-${cameraId}`);
+        let countdown = 5;
+        
+        const interval = setInterval(() => {
+            countdown--;
+            countdownElement.textContent = `Initializing camera... ${countdown} seconds remaining`;
+            
+            if (countdown <= 0) {
+                clearInterval(interval);
+                overlay.style.animation = 'fadeOut 0.3s ease-in-out forwards';
+                setTimeout(() => overlay.remove(), 300);
+            }
+        }, 1000);
+    }
+
+    // Update updateRecordingStatus function to handle removed cameras
+    async function updateRecordingStatus(cameraId) {
+        // Check if polling is still active
+        if (!activePolling.get(cameraId)) {
+            return;
+        }
+
+        try {
+            // Check if camera still exists
+            const button = document.querySelector(`#camera-${cameraId} .btn-record`);
+            if (!button) {
+                clearAllCameraResources(cameraId);
+                return;
+            }
+
+            const response = await fetch(`/recording_status/${cameraId}`);
+            
+            // Handle 404 and other errors
+            if (!response.ok) {
+                if (response.status === 404) {
+                    clearAllCameraResources(cameraId);
+                }
+                return;
+            }
+
+            const data = await response.json();
+            const isRecording = data.recording_status.active_recording !== null;
+            
+            // Only update if button state doesn't match server state
+            if (isRecording !== button.classList.contains('recording')) {
+                updateRecordingButtonState(button, isRecording);
+            }
+        } catch (error) {
+            console.error('Error updating recording status:', error);
+            // Don't clear resources on network errors
+        }
+    }
+
+    // Add a helper function to update button state
+    function updateRecordingButtonState(button, isRecording) {
+        if (isRecording && !button.classList.contains('recording')) {
+            button.classList.add('recording');
+            button.innerHTML = `
+                <i class="fas fa-stop-circle"></i>
+                <span>Stop Recording</span>
+            `;
+            button.style.backgroundColor = 'var(--danger-color)';
+        } else if (!isRecording && button.classList.contains('recording')) {
+            button.classList.remove('recording');
+            button.innerHTML = `
+                <i class="fas fa-circle"></i>
+                <span>Start Recording</span>
+            `;
+            button.style.backgroundColor = 'var(--success-color)';
+        }
+    }
+
+    // History management
+    let historyVisible = false;
+
+    function toggleHistory() {
+        const sidebar = document.querySelector('.history-sidebar');
+        historyVisible = !historyVisible;
+        sidebar.classList.toggle('open', historyVisible);
+    }
+
+    function saveCameraToHistory(source, name) {
+        const history = JSON.parse(localStorage.getItem('cameraHistory') || '[]');
+        
+        // Remove existing entry if exists
+        const existingIndex = history.findIndex(c => c.source === source);
+        if (existingIndex > -1) history.splice(existingIndex, 1);
+        
+        // Add to beginning with timestamp
+        history.unshift({
+            source,
+            name,
+            timestamp: new Date().toISOString()
+        });
+        
+        // Keep only last 20 entries
+        if (history.length > 20) history.pop();
+        
+        localStorage.setItem('cameraHistory', JSON.stringify(history));
+        displayHistory();
+    }
+
+    function displayHistory() {
+        const history = JSON.parse(localStorage.getItem('cameraHistory') || '[]');
+        const list = document.getElementById('history-list');
+        
+        list.innerHTML = history.map((cam, index) => `
+            <div class="history-item" onclick="loadHistoryEntry(${index})">
+                <div class="history-item-header">
+                    <span class="history-item-name">${cam.name || 'Unnamed Camera'}</span>
+                    <span class="history-item-time">${new Date(cam.timestamp).toLocaleString()}</span>
+                </div>
+                <div class="history-item-source">${cam.source}</div>
+            </div>
+        `).join('');
+    }
+
+    function loadHistoryEntry(index) {
+        const history = JSON.parse(localStorage.getItem('cameraHistory') || '[]');
+        const entry = history[index];
+        
+        if (entry) {
+            document.getElementById('newCameraSource').value = entry.source;
+            document.getElementById('newCameraName').value = entry.name;
+            toggleCameraForm();
+        }
+    }
+
+    function clearHistory() {
+        localStorage.removeItem('cameraHistory');
+        displayHistory();
+    }
+    </script>
+</body>
+</html>
