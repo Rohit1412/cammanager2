@@ -21,6 +21,7 @@ from config import Config
 import shutil
 from pathlib import Path
 from utils import GPU_AVAILABLE
+import psutil
 
 # Move app creation to top, after imports
 app = Quart(__name__)
@@ -46,47 +47,37 @@ def determine_camera_type(source):
     logging.info(f"Attempting to determine camera type for source: {source}")
     
     # Handle integer or string number for USB cameras
-    if isinstance(source, int) or (isinstance(source, str) and source.isdigit()):
+    if isinstance(source, (int, str)):
         try:
-            source_int = int(source)
-            logging.info(f"Testing USB camera at index {source_int}")
+            if isinstance(source, str):
+                if any(source.startswith(p) for p in ['rtsp://', 'rtmp://', 'http://']):
+                    return 'network', source
+                source = int(source)
             
-            # Test if camera is accessible
-            cap = cv2.VideoCapture(source_int)
+            # Test camera accessibility
+            cap = cv2.VideoCapture(source)
             if cap.isOpened():
-                # Get camera properties
-                width = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
-                height = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
-                fps = cap.get(cv2.CAP_PROP_FPS)
-                logging.info(f"Successfully opened camera. Properties: width={width}, height={height}, fps={fps}")
-                
-                cap.release()
-                return 'usb', source_int  # Return both type and source
-            else:
-                available_cameras = []
-                # Try to find available cameras
-                for i in range(10):
-                    temp_cap = cv2.VideoCapture(i)
-                    if temp_cap.isOpened():
-                        available_cameras.append(i)
-                        temp_cap.release()
-                
-                if available_cameras:
-                    logging.error(f"Camera index {source} not available. Available cameras: {available_cameras}")
-                else:
-                    logging.error("No cameras found on system")
-                raise ValueError(f"Unable to open USB camera at index {source}")
+                ret, frame = cap.read()
+                if ret and frame is not None:
+                    cap.release()
+                    return 'usb', source
+            cap.release()
+            
+            # Try CamGear as fallback
+            from vidgear.gears import CamGear
+            cap = CamGear(source=source).start()
+            frame = cap.read()
+            if frame is not None:
+                cap.stop()
+                return 'usb', source
+            cap.stop()
+            
         except Exception as e:
-            logging.error(f"Error accessing USB camera: {str(e)}")
-            raise ValueError(f"Error accessing USB camera: {str(e)}")
+            logging.error(f"Error accessing camera: {str(e)}")
+            
+        raise ValueError(f"Unable to access camera source: {source}")
     
-    # Handle URL-based sources
-    source_str = str(source).lower()
-    for protocol, pattern in PROTOCOL_PATTERNS.items():
-        if re.match(pattern, source_str):
-            return protocol, source  # Return both type and source
-    
-    raise ValueError(f"Unsupported camera source: {source}")
+    raise ValueError(f"Unsupported camera source type: {type(source)}")
 
 class CameraCapture:
     """Factory class to create appropriate camera capture instance"""
@@ -168,6 +159,19 @@ class AsyncCamera:
         self.name = name
         self.camera_id = None
         
+        # Initialize capture based on source type
+        try:
+            if isinstance(source, str) and any(source.startswith(p) for p in ['rtsp://', 'rtmp://', 'http://']):
+                # Network stream
+                self._init_network_stream(source)
+            else:
+                # Local camera
+                self._init_local_camera(source)
+                
+        except Exception as e:
+            logger.error(f"Failed to initialize camera: {str(e)}")
+            raise CameraInitError(f"Camera initialization failed: {str(e)}")
+        
         # Use config values for frame dimensions
         self.frame_shape = (
             config.camera.frame_height,
@@ -192,6 +196,10 @@ class AsyncCamera:
         self._processes = []  # Keep track of all child processes
         self._cleanup_lock = asyncio.Lock()
         self._shared_memory = []  # Track shared memory objects
+        self.last_cpu_check = time.time()
+        self.cpu_check_interval = 5.0  # Check CPU every 5 seconds
+        self.frame_counter = 0  # For frame skipping
+        self.adaptive_fps = max_fps or config.camera.max_fps
         
     def _track_shared_memory(self, shm):
         """Track shared memory for cleanup"""
@@ -275,47 +283,87 @@ class AsyncCamera:
         self._add_process(self.capture_process)
         self.capture_process.start()
 
-    def _capture_loop(self, source, max_fps):
-        capture = None
-        consecutive_failures = 0
-        max_failures = 10
+    def should_process_frame(self):
+        """Determine if the current frame should be processed"""
+        self.frame_counter += 1
         
-        try:
-            capture, camera_type = CameraCapture.create_capture(source)  # Get both values
-            logging.info(f"Camera initialized: type={camera_type}, source={source}")
+        # Skip every other frame when CPU is high
+        if psutil.cpu_percent() > 60:
+            return self.frame_counter % 2 == 0
+        
+        return True
+
+    def _adjust_fps_by_cpu(self):
+        """Dynamically adjust FPS based on CPU usage"""
+        current_time = time.time()
+        if current_time - self.last_cpu_check >= self.cpu_check_interval:
+            cpu_usage = psutil.cpu_percent()
             
+            if cpu_usage > 80:
+                self.adaptive_fps = max(10, self.adaptive_fps - 5)
+                logger.info(f"Reducing FPS to {self.adaptive_fps} due to high CPU usage: {cpu_usage}%")
+            elif cpu_usage < 60 and self.adaptive_fps < self.max_fps:
+                self.adaptive_fps = min(self.max_fps, self.adaptive_fps + 2)
+                logger.info(f"Increasing FPS to {self.adaptive_fps} due to low CPU usage: {cpu_usage}%")
+                
+            self.last_cpu_check = current_time
+
+    def _capture_loop(self, source, max_fps):
+        """Modified capture loop with frame skipping and adaptive FPS"""
+        try:
             last_frame_time = time.time()
-            frame_interval = 1.0 / max_fps
+            consecutive_failures = 0
+            max_failures = 10
 
             while self.status_array[2] > 0:
                 current_time = time.time()
+                frame_interval = 1.0 / self.adaptive_fps
+                
+                # Adjust FPS based on CPU usage
+                self._adjust_fps_by_cpu()
+                
                 if current_time - last_frame_time >= frame_interval:
-                    frame = CameraCapture.read_frame(capture, camera_type)
-                    
+                    # Read frame based on capture type
+                    if isinstance(self.cap, cv2.VideoCapture):
+                        ret, frame = self.cap.read()
+                        if not ret:
+                            frame = None
+                    else:  # CamGear
+                        frame = self.cap.read()
+
                     if frame is not None:
-                        consecutive_failures = 0
-                        if frame.shape != self.frame_shape:
-                            frame = cv2.resize(frame, 
-                                            (self.frame_shape[1], self.frame_shape[0]))
-                        self.frame_array[:] = frame
-                        self.status_array[1] = 1.0 / (current_time - last_frame_time)
-                        last_frame_time = current_time
+                        # Only process frame if needed
+                        if self.should_process_frame():
+                            consecutive_failures = 0
+                            # Resize if necessary
+                            if frame.shape != self.frame_shape:
+                                frame = cv2.resize(frame, (self.frame_shape[1], self.frame_shape[0]))
+                            # Update shared memory
+                            self.frame_array[:] = frame
+                            self.status_array[1] = 1.0 / (current_time - last_frame_time)
+                            last_frame_time = current_time
                     else:
                         consecutive_failures += 1
-                        logging.warning(f"Failed to read frame. Attempt {consecutive_failures}/{max_failures}")
+                        logger.warning(f"Failed to read frame. Attempt {consecutive_failures}/{max_failures}")
                         if consecutive_failures >= max_failures:
                             raise ValueError("Too many consecutive failures reading frames")
                         time.sleep(0.1)
 
         except Exception as e:
-            logging.error(f"Error in capture loop: {str(e)}")
-            self.status_array[2] = 0.0  # Signal process to stop
+            logger.error(f"Error in capture loop: {str(e)}")
+            self.status_array[2] = 0.0
         finally:
-            if capture is not None:
-                if camera_type in ['rtmp', 'http', 'https', 'ip']:
-                    capture.stop()
-                else:
-                    capture.release()
+            self._cleanup_capture()
+
+    def _cleanup_capture(self):
+        """Clean up capture resources"""
+        try:
+            if isinstance(self.cap, cv2.VideoCapture):
+                self.cap.release()
+            else:  # CamGear
+                self.cap.stop()
+        except Exception as e:
+            logger.error(f"Error cleaning up capture: {str(e)}")
 
     async def start_recording(self, duration=None, quality=None):
         """Start recording with optional duration and quality settings"""
@@ -639,6 +687,44 @@ class AsyncCamera:
                     # ... rest of processing ...
         except Exception as e:
             logger.error(f"Frame processing error: {str(e)}")
+
+    def _init_network_stream(self, source):
+        """Initialize network stream with FFmpeg"""
+        ffmpeg_cmd = (
+            f'ffmpeg -rtsp_transport tcp -i {source} '
+            f'-vsync 0 -copyts '
+            f'-thread_queue_size 4096 '
+            f'-f rawvideo -pix_fmt bgr24 -'
+        )
+        self.cap = cv2.VideoCapture(ffmpeg_cmd)
+        if not self.cap.isOpened():
+            raise CameraInitError(f"Failed to open network stream: {source}")
+
+    def _init_local_camera(self, source):
+        """Initialize local camera with proper checks"""
+        # First try direct OpenCV capture
+        self.cap = cv2.VideoCapture(source)
+        if self.cap.isOpened():
+            logger.info(f"Successfully opened camera with OpenCV: {source}")
+            return
+
+        # If OpenCV fails, try CamGear
+        try:
+            from vidgear.gears import CamGear
+            options = {
+                "THREADED_QUEUE_MODE": False,  # Set to False as it's causing issues
+                "THREAD_TIMEOUT": 2000,
+            }
+            self.cap = CamGear(source=source, logging=True, **options).start()
+            
+            # Verify CamGear stream
+            test_frame = self.cap.read()
+            if test_frame is None:
+                raise CameraInitError("CamGear failed to read test frame")
+                
+            logger.info(f"Successfully opened camera with CamGear: {source}")
+        except Exception as e:
+            raise CameraInitError(f"Failed to initialize camera with both OpenCV and CamGear: {str(e)}")
 
 @app.websocket('/stream/<int:camera_id>')
 @handle_camera_errors
@@ -1169,7 +1255,6 @@ async def check_system_health():
                 disk_usage.free / 1e9))
             
         # Get memory usage
-        import psutil
         mem = psutil.virtual_memory()
         if mem.percent > 90:
             logger.warning("High memory usage: {:.1f}% used".format(mem.percent))
