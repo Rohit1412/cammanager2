@@ -1252,6 +1252,33 @@ body {
         localStorage.removeItem('cameraHistory');
         displayHistory();
     }
+
+    function startStream(cameraId) {
+        const img = document.getElementById(`camera-${cameraId}`);
+        if (!img) return;
+
+        const ws = new WebSocket(`ws://${window.location.host}/stream/${cameraId}`);
+        
+        ws.onmessage = function(event) {
+            const blob = new Blob([event.data], {type: 'image/jpeg'});
+            img.src = URL.createObjectURL(blob);
+        };
+        
+        ws.onerror = function(error) {
+            console.error('WebSocket Error:', error);
+        };
+        
+        ws.onclose = function() {
+            console.log('Stream closed');
+            // Attempt to reconnect after 1 second
+            setTimeout(() => startStream(cameraId), 1000);
+        };
+    }
+
+    // Start streaming when camera is added
+    document.addEventListener('cameraAdded', function(e) {
+        startStream(e.detail.cameraId);
+    });
     </script>
 </body>
 </html>
