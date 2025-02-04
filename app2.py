@@ -11,7 +11,7 @@ from vidgear.gears import CamGear
 import socket
 from contextlib import closing
 import re
-from .logging_config import setup_logging
+from logging_config import setup_logging
 from error_handlers import handle_camera_errors, CameraError, CameraInitError, StreamError, RecordingError
 from recording_manager import RecordingManager
 import signal
@@ -21,6 +21,12 @@ from config import Config
 import shutil
 from pathlib import Path
 from utils import GPU_AVAILABLE
+import psutil
+import json
+from functools import lru_cache
+import threading
+from typing import Optional, Dict, Any
+import subprocess
 
 # Move app creation to top, after imports
 app = Quart(__name__)
@@ -135,31 +141,25 @@ class CameraManager:
 RECORDING_DIR = 'recordings'
 
 def cleanup_shared_memory(camera_id):
-    """Clean up any existing shared memory for a camera ID"""
-    shm_names = [
-        f"camera_frame_{camera_id}",
-        f"camera_status_{camera_id}",
-        f"recording_status_{camera_id}"
-    ]
-    
-    for shm_name in shm_names:
+    """Clean up any existing shared memory files"""
+    try:
+        # Try to clean up frame shared memory
         try:
-            # First try to attach to existing shared memory
-            shm = shared_memory.SharedMemory(name=shm_name)
-            try:
-                shm.unlink()
-            except Exception as e:
-                logger.warning(f"Error unlinking shared memory {shm_name}: {e}")
-            finally:
-                try:
-                    shm.close()
-                except Exception as e:
-                    logger.warning(f"Error closing shared memory {shm_name}: {e}")
+            shm = shared_memory.SharedMemory(name=f'frame_{camera_id}')
+            shm.close()
+            shm.unlink()
         except FileNotFoundError:
-            # Shared memory doesn't exist, which is fine
-            continue
-        except Exception as e:
-            logger.warning(f"Error accessing shared memory {shm_name}: {e}")
+            pass
+
+        # Try to clean up status shared memory
+        try:
+            shm = shared_memory.SharedMemory(name=f'status_{camera_id}')
+            shm.close()
+            shm.unlink()
+        except FileNotFoundError:
+            pass
+    except Exception as e:
+        logger.error(f"Error cleaning up shared memory: {str(e)}")
 
 class AsyncCamera:
     def __init__(self, source, max_fps=None, name="default"):
@@ -167,60 +167,97 @@ class AsyncCamera:
         self.max_fps = max_fps or config.camera.max_fps
         self.name = name
         self.camera_id = None
+        self.cap = None
+        self.frame_count = 0
+        self.last_frame_time = None
+        self.is_recording = False
+        self.current_recording = None
         
-        # Use config values for frame dimensions
+        # Performance metrics
+        self.performance_metrics = {
+            'frame_times': [],
+            'cpu_usage': [],
+            'memory_usage': []
+        }
+        
+        # Health monitoring
+        self.health_stats = {
+            'frames_processed': 0,
+            'dropped_frames': 0,
+            'errors': [],
+            'last_frame_time': None
+        }
+        
+        # Frame shape from config
         self.frame_shape = (
             config.camera.frame_height,
             config.camera.frame_width,
             3
         )
         self.frame_size = np.prod(self.frame_shape) * np.dtype(np.uint8).itemsize
-        
-        # Don't create shared memory here - move to setup method
-        self.frame_shm = None
-        self.status_shm = None
-        self.frame_array = None
-        self.status_array = None
-        self.recording_dir = None
-        
-        # Add these attributes
+        self._running = True  # Add this flag
+        self._recording_lock = asyncio.Lock()  # Add lock for recording
         self.recording_process = None
-        self.is_recording = False
-        self.current_recording = None
-        self.recording_quality = None
-        self._is_stopping = False
-        self._processes = []  # Keep track of all child processes
-        self._cleanup_lock = asyncio.Lock()
-        self._shared_memory = []  # Track shared memory objects
+        self._frame_queue = asyncio.Queue(maxsize=30)  # Buffer for recording
         
-    def _track_shared_memory(self, shm):
-        """Track shared memory for cleanup"""
-        self._shared_memory.append(shm)
+        # Add reconnection settings
+        self.max_reconnect_attempts = 3
+        self.reconnect_attempts = 0
+        self.reconnect_delay = 5  # seconds
+        self.connection_timeout = 10  # seconds
+        
+        # Add recording settings
+        self.recording_fps = 30.0  # Default recording FPS
+        self.recording_dir = None
+        self._recording_lock = asyncio.Lock()
+        self.recording_process = None
+        self._frame_queue = asyncio.Queue(maxsize=30)
+        self.recording_start_time = None
+        self.recording_status = {
+            'is_recording': False,
+            'duration': 0,
+            'message': '',
+            'error': None
+        }
+        self.recording_task = None  # Add this to track the recording task
+        
+        # Add FFmpeg settings
+        self.ffmpeg_process = None
+        self.encoding_format = 'bgr24'  # Default OpenCV format
+        self.recording_codec = 'libx264'
+        self.recording_preset = 'ultrafast'
 
-    def setup(self, camera_id):
-        """Initialize shared memory after camera_id is assigned"""
-        self.camera_id = camera_id
+    async def setup(self, camera_id):
+        """Initialize camera resources"""
+        try:
+            self.camera_id = camera_id
         
         # Clean up any existing shared memory first
-        cleanup_shared_memory(camera_id)
+            cleanup_shared_memory(camera_id)
         
-        try:
-            # Initialize frame shape and shared memory using config values
-            self.frame_size = np.prod(self.frame_shape) * np.dtype(np.uint8).itemsize
-            self.frame_shm = shared_memory.SharedMemory(
-                name=f"camera_frame_{camera_id}", 
-                create=True, 
-                size=self.frame_size
-            )
-            self._track_shared_memory(self.frame_shm)
+            # Initialize camera capture
+            if isinstance(self.source, (int, str)):
+                self.cap = cv2.VideoCapture(self.source)
+                if not self.cap.isOpened():
+                    raise CameraError(f"Failed to open camera source: {self.source}")
+                
+                # Set camera properties
+                self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.frame_shape[1])
+                self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.frame_shape[0])
+                self.cap.set(cv2.CAP_PROP_FPS, self.max_fps)
             
-            # Status array
-            self.status_shm = shared_memory.SharedMemory(
-                name=f"camera_status_{camera_id}",
-                create=True,
-                size=5 * np.dtype(np.float32).itemsize
+            # Initialize shared memory
+            self.frame_shm = shared_memory.SharedMemory(
+                create=True, 
+                size=self.frame_size,
+                name=f'frame_{self.camera_id}'
             )
-            self._track_shared_memory(self.status_shm)
+            
+            self.status_shm = shared_memory.SharedMemory(
+                create=True,
+                size=5 * np.dtype(np.float32).itemsize,
+                name=f'status_{self.camera_id}'
+            )
 
             # Initialize arrays
             self.frame_array = np.ndarray(
@@ -228,20 +265,22 @@ class AsyncCamera:
                 dtype=np.uint8,
                 buffer=self.frame_shm.buf
             )
+            
             self.status_array = np.ndarray(
                 (5,),
                 dtype=np.float32,
                 buffer=self.status_shm.buf
             )
-            self.status_array.fill(0)
             
-            self.recording_dir = os.path.join(RECORDING_DIR, f"{self.name}_{camera_id}")
-            os.makedirs(self.recording_dir, exist_ok=True)
+            # Initialize status array with default values
+            self.status_array.fill(0)
+            self.status_array[2] = 1.0  # Set active status
+            
             return True
+            
         except Exception as e:
-            logger.error(f"Error in setup: {str(e)}")
-            self.cleanup()
-            raise e
+            logger.error(f"Camera setup failed: {str(e)}")
+            return False
 
     def _add_process(self, process):
         """Add process to tracking list"""
@@ -267,13 +306,23 @@ class AsyncCamera:
             self._remove_process(process)
 
     async def start(self):
-        self.status_array[2] = 1.0  # Set running flag
-        self.capture_process = Process(
-            target=self._capture_loop,
-            args=(self.source, self.max_fps)
-        )
-        self._add_process(self.capture_process)
-        self.capture_process.start()
+        """Start camera with proper initialization"""
+        try:
+            # Initialize status array if needed
+            if self.status_array is None:
+                self.status_array = np.zeros(5, dtype=np.float32)
+            
+            self.status_array[2] = 1.0  # Set running flag
+            self.capture_process = Process(
+                target=self._capture_loop,
+                args=(self.source, self.max_fps)
+            )
+            self._add_process(self.capture_process)
+            self.capture_process.start()
+            return True
+        except Exception as e:
+            logger.error(f"Start error: {e}")
+            return False
 
     def _capture_loop(self, source, max_fps):
         capture = None
@@ -317,289 +366,366 @@ class AsyncCamera:
                 else:
                     capture.release()
 
-    async def start_recording(self, duration=None, quality=None):
-        """Start recording with optional duration and quality settings"""
-        if self.is_recording:
-            return False, "Already recording"
-            
+    async def _setup_recording_directory(self, output_dir=None):
+        """Setup recording directory"""
         try:
-            # Create date-based subdirectory
-            date_dir = datetime.now().strftime('%Y-%m-%d')
-            timestamp = datetime.now().strftime('cam_%H-%M-%S.mp4')
+            timestamp = datetime.now()
+            if output_dir is None:
+                output_dir = os.path.join('recordings', 
+                                        f'camera_{self.camera_id}',
+                                        timestamp.strftime('%Y-%m-%d'))
             
-            # Create full directory path
-            recording_subdir = os.path.join(self.recording_dir, date_dir)
-            os.makedirs(recording_subdir, exist_ok=True)
+            os.makedirs(output_dir, exist_ok=True)
+            self.recording_dir = output_dir
+            return output_dir
             
-            # Full path for the output file
-            output_path = os.path.join(recording_subdir, timestamp)
-            
-            # Set recording quality
-            if quality:
-                self.recording_quality = quality
-            
-            # Clean up any existing shared memory
-            await self._cleanup_recording_resources()
-            
-            # Initialize new recording
-            await self._initialize_recording(output_path)
-            
-            logger.info(f"Recording started successfully: {output_path}")
-            return True, f"Recording started: {output_path}"
-        except Exception as e:
-            logger.error(f"Failed to start recording: {str(e)}", exc_info=True)
-            await self._cleanup_recording_resources()
-            return False, str(e)
+        except (PermissionError, OSError) as e:
+            error_msg = f"Failed to create recording directory: {str(e)}"
+            self.health_stats['errors'].append(error_msg)
+            logger.error(f"Failed to start recording: {str(e)}")
+            raise RecordingError(error_msg)
 
-    async def _cleanup_recording_resources(self):
-        """Clean up recording-related resources"""
-        if hasattr(self, 'recording_status_shm'):
+    async def start_recording(self, output_dir=None):
+        """Start recording camera feed"""
+        async with self._recording_lock:
+            if self.is_recording:
+                return False, "Already recording"
+            
             try:
-                self.recording_status_shm.close()
-                self.recording_status_shm.unlink()
-            except Exception as e:
-                logger.warning(f"Error cleaning up recording resources: {str(e)}")
-
-    async def _initialize_recording(self, output_path):
-        """Initialize recording resources"""
-        # Create shared memory for recording status
-        self.recording_status_shm = shared_memory.SharedMemory(
-            create=True,
-            size=np.dtype(np.bool_).itemsize,
-            name=f"recording_status_{self.camera_id}"
-        )
-        self.recording_status = np.ndarray(
-            (1,), dtype=np.bool_, buffer=self.recording_status_shm.buf
-        )
-        self.recording_status[0] = True
-        
-        # Start recording process
-        self.recording_process = Process(
-            target=self._record_video,
-            args=(
-                output_path,
-                f"camera_frame_{self.camera_id}",
-                self.frame_shape,
-                f"recording_status_{self.camera_id}",
-                self.recording_quality
-            )
-        )
-        self._add_process(self.recording_process)
-        self.recording_process.start()
-        
-        # Update status
-        self.is_recording = True
-        self.status_array[0] = 1.0
-        self.current_recording = output_path
-
-    def _record_video(self, output_path, frame_shm_name, frame_shape, recording_status_name, quality):
-        """Recording process function"""
-        frame_shm = None
-        recording_status_shm = None
-        out = None
-        
-        try:
-            # Reconnect to shared memory in the new process
-            frame_shm = shared_memory.SharedMemory(name=frame_shm_name)
-            recording_status_shm = shared_memory.SharedMemory(name=recording_status_name)
-            
-            frame_array = np.ndarray(frame_shape, dtype=np.uint8, buffer=frame_shm.buf)
-            recording_status = np.ndarray((1,), dtype=np.bool_, buffer=recording_status_shm.buf)
-            
-            # Initialize video writer
-            out = self.create_video_writer(output_path, 'mp4v', self.max_fps, (frame_shape[1], frame_shape[0]))
-
-            while recording_status[0]:  # Check recording status
+                # Verify FFmpeg installation
                 try:
-                    # Make a copy of the frame to avoid any race conditions
-                    frame = np.copy(frame_array)
-                    if frame is not None and frame.size > 0:
-                        out.write(frame)
-                    time.sleep(1.0 / self.max_fps)
-                except Exception as e:
-                    logging.error(f"Error writing frame: {str(e)}")
-                    break
-                    
-        except Exception as e:
-            logging.error(f"Recording process error: {str(e)}")
-        finally:
-            # Clean up resources
-            if out is not None:
-                out.release()
-            if frame_shm is not None:
-                frame_shm.close()
-            if recording_status_shm is not None:
-                recording_status_shm.close()
+                    process = await asyncio.create_subprocess_exec(
+                        'ffmpeg', '-version',
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE
+                    )
+                    await process.communicate()
+                    if process.returncode != 0:
+                        raise RecordingError("FFmpeg is not properly installed")
+                except FileNotFoundError:
+                    raise RecordingError("FFmpeg is not installed")
 
-    def create_video_writer(self, output_path, codec, fps, resolution):
-        """Create video writer with GPU support if available"""
-        fourcc = cv2.VideoWriter_fourcc(*codec)
-        
-        if GPU_AVAILABLE and config.recording.hardware_acceleration:
-            # Initialize GPU-accelerated writer
-            writer = cv2.cudacodec.createVideoWriter(
-                output_path,
-                cv2.VideoWriter.fourcc(*codec),
-                fps,
-                resolution,
-                True
-            )
-            return writer
-        else:
-            # Fallback to CPU writer
-            return cv2.VideoWriter(
-                output_path,
-                fourcc,
-                fps,
-                resolution
-            )
-
-    async def stop_recording(self):
-        """Stop the current recording"""
-        if not self.is_recording:
-            return False, "Not recording"
-            
-        try:
-            # Signal recording process to stop
-            if hasattr(self, 'recording_status'):
-                self.recording_status[0] = False
-            
-            if self.recording_process:
-                # Give the process a moment to finish cleanly
-                await asyncio.sleep(0.5)
+                # Get a test frame to verify camera and frame format
+                test_frame = await self.get_frame()
+                if test_frame is None:
+                    raise RecordingError("Unable to capture frames from camera")
                 
-                # Check if process exists and is alive before trying to terminate
-                if hasattr(self, 'recording_process') and self.recording_process and self.recording_process.is_alive():
-                    await self._terminate_process(self.recording_process)
+                height, width = test_frame.shape[:2]
+                
+                # Setup recording directory
+                output_dir = await self._setup_recording_directory(output_dir)
+                timestamp = datetime.now()
+                output_file = os.path.join(
+                    output_dir,
+                    f'recording_{timestamp.strftime("%H-%M-%S")}.mp4'
+                )
+                
+                # Construct FFmpeg command with explicit pixel format
+                command = [
+                    'ffmpeg',
+                    '-y',  # Overwrite output file
+                    '-f', 'rawvideo',
+                    '-vcodec', 'rawvideo',
+                    '-s', f'{width}x{height}',
+                    '-pix_fmt', self.encoding_format,
+                    '-r', str(self.recording_fps),
+                    '-i', 'pipe:0',
+                    '-c:v', self.recording_codec,
+                    '-preset', self.recording_preset,
+                    '-pix_fmt', 'yuv420p',  # Ensure compatibility
+                    '-crf', '23',
+                    '-movflags', '+faststart',
+                    output_file
+                ]
+                
+                # Start FFmpeg process
+                self.recording_process = await asyncio.create_subprocess_exec(
+                    *command,
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                
+                if not self.recording_process:
+                    raise RecordingError("Failed to start FFmpeg process")
+                
+                # Initialize recording state
+                self.current_recording = output_file
+                self.recording_fps = float(self.recording_fps)
+                self.recording_start_time = time.time()
+                self.is_recording = True
+                
+                # Start recording task
+                self.recording_task = asyncio.create_task(self._recording_task())
+                
+                logger.info(f"Recording started: {output_file} at {self.recording_fps} FPS")
+                return True, f"Recording started: {output_file}"
+                
+            except Exception as e:
+                logger.error(f"Failed to start recording: {str(e)}")
+                self.is_recording = False
+                self.current_recording = None
+                if hasattr(self, 'recording_process') and self.recording_process:
+                    self.recording_process.kill()
+                    self.recording_process = None
+                raise RecordingError(str(e))
+
+    async def _recording_task(self):
+        """Background task to handle recording"""
+        frame_count = 0
+        start_time = time.time()
+        frame_interval = 1.0 / self.recording_fps
+        next_frame_time = start_time
+        
+        try:
+            while self.is_recording and self.recording_process:
+                current_time = time.time()
+                
+                if current_time >= next_frame_time:
+                    frame = await self.get_frame()
+                    if frame is not None:
+                        try:
+                            # Ensure frame is in correct format
+                            if not isinstance(frame, np.ndarray):
+                                logger.error("Invalid frame format")
+                                continue
+                                
+                            # Check if process is still alive
+                            if self.recording_process.returncode is not None:
+                                logger.error("FFmpeg process has terminated")
+                                break
+                                
+                            # Write frame
+                            try:
+                                frame_bytes = frame.tobytes()
+                                await self.recording_process.stdin.write(frame_bytes)
+                                await self.recording_process.stdin.drain()
+                                frame_count += 1
+                                
+                                # Log progress
+                                if frame_count % 30 == 0:
+                                    elapsed = time.time() - start_time
+                                    fps = frame_count / elapsed
+                                    logger.debug(f"Recording at {fps:.1f} FPS")
+                                    
+                            except (BrokenPipeError, ConnectionError) as e:
+                                logger.error(f"FFmpeg pipe error: {e}")
+                                break
+                                
+                        except Exception as e:
+                            logger.error(f"Frame processing error: {e}")
+                            continue
+                            
+                    next_frame_time += frame_interval
+                    
+                await asyncio.sleep(frame_interval * 0.1)  # Short sleep to prevent CPU overload
+                
+        except Exception as e:
+            logger.error(f"Recording task error: {e}")
+        finally:
+            # Get FFmpeg output for debugging
+            if self.recording_process:
+                try:
+                    stderr_data = await self.recording_process.stderr.read()
+                    if stderr_data:
+                        logger.debug(f"FFmpeg output: {stderr_data.decode()}")
+                except Exception as e:
+                    logger.error(f"Error reading FFmpeg output: {e}")
+            
+            await self._safe_stop_recording()
+
+    def _update_recording_status(self, message):
+        """Update recording status with message"""
+        self.recording_status = {
+            'is_recording': self.is_recording,
+            'duration': time.time() - self.recording_start_time if self.recording_start_time else 0,
+            'message': message,
+            'error': message if 'error' in message.lower() else None
+        }
+        logger.info(f"Camera {self.camera_id}: {message}")
+
+    async def _safe_stop_recording(self):
+        """Safely stop recording and cleanup resources"""
+        try:
+            if self.recording_process:
+                try:
+                    if (hasattr(self.recording_process, 'stdin') and 
+                        self.recording_process.stdin and 
+                        not self.recording_process.stdin.is_closing()):
+                        await self.recording_process.stdin.write_eof()
+                        await self.recording_process.stdin.drain()
+                        
+                    # Wait for process to finish
+                    try:
+                        await asyncio.wait_for(self.recording_process.wait(), timeout=5.0)
+                    except asyncio.TimeoutError:
+                        logger.warning("FFmpeg process did not exit gracefully, forcing termination")
+                        self.recording_process.terminate()
+                        await asyncio.sleep(0.5)
+                        if self.recording_process.returncode is None:
+                            self.recording_process.kill()
+                        
+                except Exception as e:
+                    logger.error(f"Error during FFmpeg cleanup: {e}")
+                    if self.recording_process:
+                        self.recording_process.kill()
                 
                 self.recording_process = None
             
-            # Clean up recording status shared memory
-            if hasattr(self, 'recording_status_shm'):
-                try:
-                    self.recording_status_shm.close()
-                    self.recording_status_shm.unlink()
-                except Exception as e:
-                    logger.warning(f"Error cleaning up recording status shared memory: {str(e)}")
-                finally:
-                    delattr(self, 'recording_status_shm')
-                    if hasattr(self, 'recording_status'):
-                        delattr(self, 'recording_status')
-            
             self.is_recording = False
-            recorded_file = self.current_recording
+            logger.info(f"Recording stopped: {self.current_recording}")
             self.current_recording = None
-            self.status_array[0] = 0.0
             
-            logger.info(f"Recording stopped successfully: {recorded_file}")
-            return True, f"Recording stopped: {recorded_file}"
         except Exception as e:
-            logger.error(f"Failed to stop recording: {str(e)}", exc_info=True)
-            return False, str(e)
+            logger.error(f"Error in safe stop recording: {e}")
+            self.is_recording = False
+            self.recording_process = None
+            self.current_recording = None
+
+    async def stop_recording(self):
+        """Stop the current recording"""
+        async with self._recording_lock:
+            if not self.is_recording:
+                return False, "Not recording"
+            
+        try:
+                await self._safe_stop_recording()
+                return True, "Recording stopped successfully"
+            
+        except Exception as e:
+                logger.error(f"Error stopping recording: {str(e)}")
+                return False, str(e)
 
     async def stop(self):
         """Stop the camera and clean up resources"""
-        if self._is_stopping:
-            return True
-
-        async with self._cleanup_lock:
-            self._is_stopping = True
-            try:
-                # First stop recording if active
-                if self.is_recording:
-                    try:
-                        await self.stop_recording()
-                    except Exception as e:
-                        logger.error(f"Error stopping recording during camera shutdown: {e}")
-
-                # Signal processes to stop
-                if hasattr(self, 'status_array') and self.status_array is not None:
-                    try:
-                        self.status_array[2] = 0.0
-                    except Exception as e:
-                        logger.error(f"Error updating status array during shutdown: {e}")
-
-                # Wait briefly for processes to notice stop signal
-                await asyncio.sleep(0.5)
-
-                # Terminate processes
-                processes = self._processes.copy()
-                for process in processes:
-                    try:
-                        await self._terminate_process(process)
-                    except Exception as e:
-                        logger.error(f"Error terminating process during shutdown: {e}")
-
-                # Clean up shared memory
-                if hasattr(self, '_shared_memory'):
-                    for shm in self._shared_memory.copy():
-                        try:
-                            shm.close()
-                            shm.unlink()
-                        except Exception as e:
-                            logger.error(f"Error cleaning shared memory during shutdown: {e}")
-
-                self._shared_memory.clear()
-                return True
-            except Exception as e:
-                logger.error(f"Error during camera shutdown: {e}")
-                return False
-            finally:
-                self._is_stopping = False
-
-    async def _cleanup_shared_memory(self):
-        """Clean up shared memory resources"""
         try:
-            # Clean up frame shared memory
+            self._running = False  # Set flag to stop frame capture
+            
+            # Stop recording if active
+            if self.is_recording:
+                    await self.stop_recording()
+
+            # Release camera
+            if self.cap and self.cap.isOpened():
+                self.cap.release()
+                self.cap = None
+            
+            # Clean up shared memory
             if hasattr(self, 'frame_shm') and self.frame_shm:
                 try:
                     self.frame_shm.close()
                     self.frame_shm.unlink()
                 except Exception as e:
-                    logger.warning(f"Error cleaning up frame shared memory: {str(e)}")
-
-            # Clean up status shared memory
+                    logger.error(f"Error cleaning up frame shared memory: {e}")
+                    
             if hasattr(self, 'status_shm') and self.status_shm:
                 try:
                     self.status_shm.close()
                     self.status_shm.unlink()
                 except Exception as e:
-                    logger.warning(f"Error cleaning up status shared memory: {str(e)}")
+                    logger.error(f"Error cleaning up status shared memory: {e}")
 
-            # Clean up recording status shared memory
-            if hasattr(self, 'recording_status_shm') and self.recording_status_shm:
-                try:
-                    self.recording_status_shm.close()
-                    self.recording_status_shm.unlink()
-                except Exception as e:
-                    logger.warning(f"Error cleaning up recording status shared memory: {str(e)}")
+            cleanup_shared_memory(self.camera_id)
+            
+            logger.info(f"Camera {self.camera_id} stopped and cleaned up successfully")
+            return True
+            
         except Exception as e:
-            logger.error(f"Error in cleanup_shared_memory: {str(e)}")
+            logger.error(f"Error during camera cleanup: {str(e)}")
+            return False
 
-    async def _safe_shared_memory_access(self, operation, max_retries=3):
-        """Safely perform shared memory operations with retries"""
-        retries = 0
-        while retries < max_retries:
-            try:
-                return operation()
-            except FileNotFoundError:
-                logger.warning(f"Shared memory not found, retrying ({retries+1}/{max_retries})")
-                await asyncio.sleep(0.1 * (retries + 1))
-                retries += 1
-            except Exception as e:
-                logger.error(f"Shared memory error: {str(e)}")
-                raise
-        raise RuntimeError("Max retries exceeded for shared memory operation")
+    async def validate_source(self):
+        """Validate camera source before initialization"""
+        try:
+            if isinstance(self.source, (int, str)):
+                if isinstance(self.source, str) and self.source.isdigit():
+                    self.source = int(self.source)
+                
+                if isinstance(self.source, int):
+                    # Test USB camera
+                    cap = cv2.VideoCapture(self.source)
+                    if not cap.isOpened():
+                        raise ValueError(f"Cannot open USB camera at index {self.source}")
+                    cap.release()
+                else:
+                    # Test network camera
+                    if not any(self.source.startswith(p) for p in ['rtsp://', 'http://', 'rtmp://']):
+                        raise ValueError("Invalid camera URL format")
+                    
+                return True
+            raise ValueError("Source must be an integer or string")
+            
+        except Exception as e:
+            logger.error(f"Camera source validation failed: {e}")
+            raise ValueError(str(e))
 
     async def get_frame(self):
-        """Safely get current frame with error handling"""
+        """Get the latest frame with proper error handling"""
         try:
-            return await self._safe_shared_memory_access(
-                lambda: np.copy(self.frame_array)
+            if not self._running or not self.cap or not self.cap.isOpened():
+                return None
+
+            # Read frame with timeout
+            ret, frame = await asyncio.wait_for(
+                asyncio.get_event_loop().run_in_executor(None, self.cap.read),
+                timeout=1.0
             )
+            
+            if not ret or frame is None:
+                logger.warning("Failed to read frame")
+                return None
+
+            # Update frame metrics
+            current_time = time.time()
+            if self.last_frame_time:
+                frame_time = current_time - self.last_frame_time
+                self.performance_metrics['frame_times'].append(frame_time)
+                if len(self.performance_metrics['frame_times']) > 30:
+                    self.performance_metrics['frame_times'] = self.performance_metrics['frame_times'][-30:]
+            
+            self.last_frame_time = current_time
+            self.frame_count += 1
+            
+            # Ensure frame is in correct format
+            if frame.shape != self.frame_shape:
+                frame = cv2.resize(frame, (self.frame_shape[1], self.frame_shape[0]))
+            
+            # Update shared memory
+            self.frame_array[:] = frame.copy()
+            
+            return frame
+
+        except asyncio.TimeoutError:
+            logger.error("Frame capture timeout")
+            return None
         except Exception as e:
-            logger.error(f"Frame access error: {str(e)}")
-            raise StreamError("Failed to retrieve frame")
+            logger.error(f"Error capturing frame: {str(e)}")
+            return None
+
+    async def _reconnect(self):
+        """Attempt to reconnect to the camera"""
+        try:
+            if self.cap:
+                self.cap.release()
+            
+            self.cap = cv2.VideoCapture(self.source)
+            if not self.cap.isOpened():
+                logger.error(f"Failed to reconnect to camera {self.camera_id}")
+                return False
+                
+            # Reset camera properties
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.frame_shape[1])
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.frame_shape[0])
+            self.cap.set(cv2.CAP_PROP_FPS, self.max_fps)
+            
+            # Reset metrics
+            self.reconnect_attempts = 0
+            self.health_stats['errors'] = []
+            
+            return True
+        except Exception as e:
+            logger.error(f"Error during reconnection: {str(e)}")
+            return False
 
     async def get_stream_metadata(self):
         """Get metadata about the current stream"""
@@ -618,50 +744,279 @@ class AsyncCamera:
         frame_size = self.frame_array.nbytes
         return int(frame_size * self.status_array[1] * 8 / 1e6)  # Mbps
 
-    async def process_frames(self):
-        """Process frames with GPU acceleration if available"""
+    async def process_frames(self, frame=None):
+        """Process frames with proper cleanup"""
         try:
-            if GPU_AVAILABLE:
-                # Upload frame to GPU
-                gpu_frame = cv2.cuda_GpuMat()
-                while self.status_array[2] > 0:
-                    frame = await self.get_frame()
-                    gpu_frame.upload(frame)
-                    # Process on GPU
-                    processed = cv2.cuda.cvtColor(gpu_frame, cv2.COLOR_BGR2RGB)
-                    # Download from GPU
-                    frame = processed.download()
-                    # ... rest of processing ...
-            else:
-                # CPU processing
-                while self.status_array[2] > 0:
-                    frame = await self.get_frame()
-                    # ... rest of processing ...
+            if frame is None:
+                return None
+                
+            # Process frame
+            processed_frame = await self._process_frame(frame)
+            
+            # Update metrics
+            self.health_stats['frames_processed'] += 1
+            
+            return processed_frame
+            
         except Exception as e:
             logger.error(f"Frame processing error: {str(e)}")
+            self.health_stats['dropped_frames'] += 1
+            return None
+            
+    async def _process_frame(self, frame):
+        """Internal frame processing method"""
+        try:
+            if frame is None:
+                return None
+            
+            # Basic processing
+            if frame.shape != self.frame_shape:
+                frame = cv2.resize(frame, (self.frame_shape[1], self.frame_shape[0]))
+            
+            return frame
+            
+        except Exception as e:
+            logger.error(f"Frame processing error: {str(e)}")
+            return None
+
+    async def _monitor_status(self):
+        """Monitor camera health and performance"""
+        while not self._is_stopping:
+            try:
+                current_time = time.time()
+                
+                # Check if camera is responsive
+                if self.last_frame_time and (current_time - self.last_frame_time) > 5:
+                    logger.warning(f"Camera {self.camera_id} not receiving frames")
+                    await self._attempt_recovery()
+                
+                # Monitor system resources
+                self.performance_metrics['cpu_usage'].append(psutil.cpu_percent())
+                self.performance_metrics['memory_usage'].append(psutil.virtual_memory().percent)
+                
+                # Cleanup old metrics (keep last hour)
+                self._cleanup_old_metrics()
+                
+                # Log health status
+                if current_time - self.last_health_check > self.health_check_interval:
+                    await self._log_health_status()
+                    self.last_health_check = current_time
+                
+                await asyncio.sleep(1)
+                
+            except Exception as e:
+                logger.error(f"Error in status monitoring: {str(e)}")
+                await asyncio.sleep(5)
+
+    async def _attempt_recovery(self):
+        """Attempt to recover camera connection"""
+        if self.reconnect_attempts >= self.max_reconnect_attempts:
+            logger.error(f"Max reconnection attempts ({self.max_reconnect_attempts}) reached")
+            return False
+            
+        try:
+            self.reconnect_attempts += 1
+            logger.info(f"Attempting camera recovery ({self.reconnect_attempts}/{self.max_reconnect_attempts})")
+            
+            if await self._reconnect():
+                self.reconnect_attempts = 0  # Reset counter on successful reconnection
+                return True
+                
+            await asyncio.sleep(self.reconnect_delay)
+            return False
+            
+        except Exception as e:
+            logger.error(f"Recovery attempt failed: {str(e)}")
+            return False
+
+    @lru_cache(maxsize=1000)
+    def get_frame_cached(self, timestamp: float) -> Optional[np.ndarray]:
+        """Get cached frame for efficient retrieval"""
+        return self.frame_buffer.get(timestamp)
+
+    async def get_camera_stats(self):
+        """Get current camera statistics"""
+        try:
+            if not self.cap or not self.cap.isOpened():
+                return {
+                    'status': 'disconnected',
+                    'fps': 0,
+                    'performance': {
+                        'cpu_usage': 0,
+                        'memory_usage': 0
+                    }
+                }
+
+            # Calculate FPS
+            if self.performance_metrics['frame_times']:
+                avg_frame_time = np.mean(self.performance_metrics['frame_times'][-30:])
+                current_fps = 1.0 / avg_frame_time if avg_frame_time > 0 else 0
+            else:
+                current_fps = 0
+
+            return {
+                'status': 'active' if self._running else 'stopped',
+                'fps': current_fps,
+                'performance': {
+                    'cpu_usage': psutil.Process().cpu_percent(),
+                    'memory_usage': psutil.Process().memory_info().rss
+                }
+            }
+        except Exception as e:
+            logger.error(f"Error getting camera stats: {str(e)}")
+            return {
+                'status': 'error',
+                'fps': 0,
+                'performance': {}
+            }
+
+    async def _measure_latency(self) -> float:
+        """Measure network latency for IP cameras"""
+        try:
+            if isinstance(self.source, str) and any(self.source.startswith(p) for p in ['rtsp://', 'http://']):
+                host = self.source.split('/')[2]
+                start_time = time.time()
+                sock = socket.create_connection((host, 80), timeout=2)
+                latency = time.time() - start_time
+                sock.close()
+                return latency
+        except Exception:
+            pass
+        return 0.0
+
+    def _cleanup_old_metrics(self):
+        """Cleanup old performance metrics"""
+        max_samples = 3600  # 1 hour of samples at 1 sample/second
+        for key in self.performance_metrics:
+            if len(self.performance_metrics[key]) > max_samples:
+                self.performance_metrics[key] = self.performance_metrics[key][-max_samples:]
+
+    async def _log_health_status(self):
+        """Log health status to file"""
+        try:
+            stats = await self.get_camera_stats()
+            log_file = f"logs/camera_{self.camera_id}_health.json"
+            os.makedirs(os.path.dirname(log_file), exist_ok=True)
+            
+            with open(log_file, 'a') as f:
+                json.dump({
+                    'timestamp': datetime.now().isoformat(),
+                    'stats': stats
+                }, f)
+                f.write('\n')
+                
+        except Exception as e:
+            logger.error(f"Error logging health status: {str(e)}")
+
+    async def cleanup(self):
+        """Clean up camera resources"""
+        try:
+            if hasattr(self, 'frame_shm') and self.frame_shm:
+                self.frame_shm.close()
+                try:
+                    self.frame_shm.unlink()
+                except Exception:
+                    pass
+
+            if hasattr(self, 'status_shm') and self.status_shm:
+                self.status_shm.close()
+                try:
+                    self.status_shm.unlink()
+                except Exception:
+                    pass
+                    
+            cleanup_shared_memory(self.camera_id)
+            
+            logger.info(f"Camera {self.camera_id} stopped and cleaned up successfully")
+        except Exception as e:
+            logger.error(f"Error during cleanup: {str(e)}")
+
+    async def __aenter__(self):
+        return self
+        
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.cleanup()
+
+    async def _safe_shared_memory_access(self, operation):
+        """Safely access shared memory with error handling"""
+        try:
+            if self.frame_array is None:
+                raise ValueError("Frame array not initialized")
+            return operation()
+        except Exception as e:
+            logger.error(f"Shared memory access error: {str(e)}")
+            raise
+
+    async def _setup_ffmpeg_recording(self, output_file):
+        """Setup FFmpeg recording with hardware acceleration"""
+        try:
+            # Configure FFmpeg command
+            ffmpeg_cmd = [
+                'ffmpeg',
+                '-y',  # Overwrite output file
+                '-f', 'rawvideo',
+                '-vcodec', 'rawvideo',
+                '-s', f'{self.frame_shape[1]}x{self.frame_shape[0]}',
+                '-pix_fmt', 'bgr24',
+                '-r', str(self.max_fps),
+                '-i', '-',  # Input from pipe
+                '-c:v', 'libx264',
+                '-preset', 'ultrafast',
+                '-f', 'mp4',
+                output_file
+            ]
+
+            # Start FFmpeg process
+            self.ffmpeg_process = subprocess.Popen(
+                ffmpeg_cmd,
+                stdin=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+            return True
+        except Exception as e:
+            logger.error(f"Failed to setup FFmpeg: {str(e)}")
+            return False
 
 @app.websocket('/stream/<int:camera_id>')
-@handle_camera_errors
 async def stream(camera_id):
-    camera = camera_registry.get_camera(camera_id)
-    if not camera:
-        logger.warning(f"Attempt to stream non-existent camera ID: {camera_id}")
-        raise CameraError(f'Camera {camera_id} not found', 404)
-    
+    """Stream camera frames over websocket"""
     try:
-        logger.info(f"Starting stream for camera {camera_id}")
-        while camera.status_array[2] > 0:
+        camera = camera_registry.get_camera(camera_id)
+        if not camera:
+                await websocket.send(json.dumps({
+                    'error': f'Camera {camera_id} not found'
+                }))
+                return logger.info(f"Starting stream for camera {camera_id}")
+        
+        while camera._running:  # Check running flag
             try:
                 frame = await camera.get_frame()
-                _, buffer = cv2.imencode('.jpg', frame)
-                await websocket.send(buffer.tobytes())
-                await asyncio.sleep(1/30)
+                if frame is not None:
+                    # Convert frame to JPEG
+                    success, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                    if success:
+                        # Send frame as binary
+                        await websocket.send(buffer.tobytes())
+                        if logger.getEffectiveLevel() <= logging.DEBUG:
+                                    logger.debug(f"Frame sent for camera {camera_id}")
+                        else:
+                                    logger.error("Failed to encode frame")
+                else:
+                    if camera._running:  # Only log if camera should be running
+                        logger.warning(f"No frame received from camera {camera_id}")
+                        await websocket.send(json.dumps({'status': 'no_frame'}))
+                    
+                await asyncio.sleep(1/30)  # Limit to ~30 FPS
+                
             except Exception as e:
-                logger.error(f"Frame processing error for camera {camera_id}: {str(e)}")
-                raise StreamError(f"Stream processing failed: {str(e)}")
+                if camera._running:  # Only log if camera should be running
+                    logger.error(f"Error streaming frame: {str(e)}")
+                    await websocket.send(json.dumps({'error': str(e)}))
+                break
+                
     except Exception as e:
-        logger.error(f"Streaming error for camera {camera_id}: {str(e)}", exc_info=True)
-        raise StreamError(f"Stream failed: {str(e)}")
+        logger.error(f"Stream error: {str(e)}")
+        await websocket.send(json.dumps({'error': str(e)}))
 
 class CameraRegistry:
     def __init__(self):
@@ -741,59 +1096,37 @@ class ProcessManager:
 process_manager = ProcessManager()
 
 @app.route('/add_camera', methods=['POST'])
-@handle_camera_errors
 async def add_camera():
+    """Add a new camera"""
     try:
-        if not request.is_json:
-            raise CameraError('Request must be JSON', 400)
-
         data = await request.get_json()
-        
-        if not data:
-            raise CameraError('Empty request body', 400)
-
         source = data.get('source')
-        if source is None:
-            raise CameraError('Camera source is required', 400)
-
-        name = data.get('name', 'default')
-        max_fps = data.get('max_fps', 20)
+        name = data.get('name', f'Camera_{len(camera_registry._cameras)}')
         
-        if isinstance(source, str) and source.isdigit():
-            source = int(source)
-            
-        # Create camera without ID first
-        try:
-            camera = AsyncCamera(source, max_fps, name)
-        except Exception as e:
-            raise CameraInitError(f'Failed to initialize camera: {str(e)}')
-            
-        # Get ID from registry
-        camera_id = await camera_registry.add_camera(camera)
+        camera = AsyncCamera(source=source, name=name)
+        camera_id = len(camera_registry._cameras)
         
-        # Setup camera with assigned ID
-        try:
-            camera.setup(camera_id)
-        except Exception as e:
-            await camera_registry.remove_camera(camera_id)
-            raise CameraInitError(f'Failed to setup camera: {str(e)}')
+        # Make setup async and await it
+        success = await camera.setup(camera_id)
+        if not success:
+            raise CameraError("Failed to setup camera")
             
-        # Start the camera
-        try:
-            await camera.start()
-        except Exception as e:
-            await camera_registry.remove_camera(camera_id)
-            raise CameraInitError(f'Failed to start camera: {str(e)}')
+        # Add to registry
+        await camera_registry.add_camera(camera)
         
-        logger.info(f'Camera {name} (ID: {camera_id}) added successfully')
+        logger.info(f"Camera {name} (ID: {camera_id}) added successfully")
         return jsonify({
             'status': 'success',
-            'camera_id': camera_id,
-            'message': f'Camera {name} added successfully'
+            'message': f'Camera {name} added successfully',
+            'camera_id': camera_id
         })
+        
     except Exception as e:
-        logger.error(f"Failed to add camera: {str(e)}", exc_info=True)
-        raise
+        logger.error(f"Failed to add camera: {str(e)}")
+        return jsonify({
+            'status': 'error',
+            'message': str(e)
+        }), 500
 
 @app.route('/remove_camera/<int:camera_id>', methods=['POST'])
 @handle_camera_errors
@@ -813,17 +1146,35 @@ async def remove_camera(camera_id):
 
 @app.route('/list_cameras', methods=['GET'])
 async def list_cameras():
-    cameras = camera_registry.list_cameras()
-    return jsonify({
-        'status': 'success',
-        'cameras': [{
-            'id': cid,
-            'name': camera.name,
-            'source': camera.source,
-            'fps': float(camera.status_array[1]),
-            'is_recording': bool(camera.status_array[0])
-        } for cid, camera in cameras]
-    })
+    """List all registered cameras"""
+    try:
+        cameras = []
+        for camera_id, camera in camera_registry._cameras.items():
+            # Get camera stats asynchronously
+            stats = await camera.get_camera_stats()
+            
+            # Convert camera object to dict for JSON serialization
+            camera_info = {
+                'id': camera_id,
+                'name': getattr(camera, 'name', 'Unknown'),
+                'status': stats['status'],
+                'fps': stats['fps'],
+                'is_recording': getattr(camera, 'is_recording', False),
+                'resolution': f"{camera.frame_shape[1]}x{camera.frame_shape[0]}" if hasattr(camera, 'frame_shape') else 'unknown',
+                'performance': stats.get('performance', {})
+            }
+            cameras.append(camera_info)
+            
+        return jsonify({
+            'status': 'success',
+                'cameras': cameras
+            })
+    except Exception as e:
+        logger.error(f"Error listing cameras: {str(e)}")
+        return jsonify({
+            'status': 'error',
+            'message': str(e)
+        }), 500
 
 @app.route('/')
 async def index():
@@ -831,45 +1182,51 @@ async def index():
 
 @app.route('/start_recording', methods=['POST'])
 @handle_camera_errors
-async def start_recording_route():
-    """Start recording for a camera with optional parameters"""
-    data = await request.get_json()
-    camera_id = data.get('camera_id')
-    duration = data.get('duration')  # Optional duration in seconds
-    quality = data.get('quality')    # Optional quality settings
-    
-    if camera_id is None:
-        raise CameraError('Camera ID is required', 400)
+async def start_recording():
+    """Start recording for a camera"""
+    try:
+        data = await request.get_json()
+        camera_id = data.get('camera_id')
+            
+        camera = camera_registry.get_camera(camera_id)
+        if not camera:
+            raise CameraError(f'Camera {camera_id} not found', 404)
         
-    camera = camera_registry.get_camera(camera_id)
-    if not camera:
-        logger.warning(f"Attempt to start recording for non-existent camera {camera_id}")
-        raise CameraError(f'Camera {camera_id} not found', 404)
-    
-    recording_info = await recording_manager.queue_recording(
-        camera, 
-        duration=duration,
-        quality=quality
-    )
-    
-    return jsonify({
-        'status': 'success',
-        'message': 'Recording queued successfully',
-        'recording_info': recording_info
-    })
+        logger.info(f"Queued recording for camera {camera_id}")
+        success, message = await camera.start_recording()
+            
+        if success:
+                return jsonify({
+                    'status': 'success',
+                            'message': message,
+                            'recording_file': camera.current_recording
+                        })
+        else:
+                        return jsonify({
+                            'status': 'error',
+                            'message': message
+                        }), 400
+            
+    except Exception as e:
+        logger.error(f"Error starting recording: {str(e)}")
+        return jsonify({
+            'status': 'error',
+            'message': str(e)
+        }), 500
 
 @app.route('/recording_status/<int:camera_id>', methods=['GET'])
 @handle_camera_errors
 async def get_recording_status(camera_id):
-    """Get recording status for a camera"""
+    """Get current recording status"""
     camera = camera_registry.get_camera(camera_id)
     if not camera:
-        raise CameraError(f'Camera {camera_id} not found', 404)
+        return jsonify({'error': 'Camera not found'})
         
-    status = recording_manager.get_recording_status(camera_id)
     return jsonify({
-        'status': 'success',
-        'recording_status': status
+        'is_recording': camera.is_recording,
+        'duration': time.time() - camera.recording_start_time if camera.recording_start_time else 0,
+        'status': camera.recording_status.get('message', ''),
+        'error': camera.recording_status.get('error')
     })
 
 @app.route('/stop_recording', methods=['POST'])

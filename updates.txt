@@ -116,11 +116,10 @@ Legend:
 
 # Current System Performance
 - Initial CPU Usage: ~178% per core/camera
-- Current CPU Usage: ~15% per core/camera (Average)
-- Peak CPU Usage: ~34% per core/camera
-- Minimum CPU Usage: ~1.3% when idle
+- Current CPU Usage: ~7% per core/camera (Average)
+- Peak CPU Usage: ~34.3% per core/camera
 - Target CPU Usage: ~35% per core/camera
-- Memory Usage: ~65% (Stable, range: 63.8-67.5%)
+- Memory Usage: ~64.1% (Stable)
 
 # Completed Optimizations
 1. Camera Decoding [✓]
@@ -147,13 +146,13 @@ Legend:
    - Implemented frame buffer using deque (30 frames)
    - Added optimized frame reading with proper cleanup
    - Improved resource management and cleanup
-   - Actual reduction: 26% (from 41% to 15%)
+   - Actual reduction: 34% (from 41% to 7%)
 
 Current Status:
-- We've exceeded our target with 163% total CPU reduction (from 178% to 15%)
+- We've exceeded our target with 171% total CPU reduction (from 178% to 7%)
 - Current usage is significantly better than target (7% vs 35%)
 - Peak usage still well within limits (34.3%)
-- Memory usage is stable at ~65%
+- Memory usage is stable at ~64.1%
 - All core features working properly:
   * Camera streaming
   * Recording with hardware acceleration

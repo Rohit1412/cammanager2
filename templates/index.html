@@ -197,28 +197,16 @@ body {
     transform: translateY(0);
 }
 
-.btn-record {
-    transition: all 0.3s ease !important;
-    position: relative;
-}
-
-.btn-record:disabled::after {
-    content: '';
-    position: absolute;
-    top: 0;
-    left: 0;
-    right: 0;
-    bottom: 0;
-    background: rgba(0, 0, 0, 0.2);
-    border-radius: 6px;
-}
-
 .btn-record:not(.recording) {
     background-color: var(--success-color) !important;
 }
 
 .btn-record.recording {
     background-color: var(--danger-color) !important;
+}
+
+.btn-record {
+    transition: transform 0.3s ease !important;
 }
 
 .btn-remove { background: #607D8B; }
@@ -858,33 +846,76 @@ body {
 
     function initializeStream(cameraId) {
         const canvas = document.getElementById(`stream-${cameraId}`);
+        if (!canvas) {
+            console.error(`Canvas not found for camera ${cameraId}`);
+            return;
+        }
+        
         const ctx = canvas.getContext('2d');
         canvasContexts.set(cameraId, ctx);
 
+        // Set initial canvas size
         canvas.width = 640;
         canvas.height = 480;
 
-        const ws = new WebSocket(getWebSocketUrl(cameraId));
+        // Clear canvas with black background
+        ctx.fillStyle = 'black';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+        const ws = new WebSocket(`ws://${window.location.host}/stream/${cameraId}`);
         websockets.set(cameraId, ws);
 
+        ws.binaryType = 'blob';  // Changed from 'arraybuffer' to 'blob'
+        
         ws.onmessage = async function(event) {
-            const blob = event.data;
-            const img = new Image();
-            img.onload = () => {
-                canvas.width = img.width;
-                canvas.height = img.height;
-                ctx.drawImage(img, 0, 0);
-            };
-            img.src = URL.createObjectURL(new Blob([blob], { type: 'image/jpeg' }));
+            try {
+                if (event.data instanceof Blob) {
+                    // Create image from blob directly
+                    const img = new Image();
+                    img.onload = () => {
+                        ctx.clearRect(0, 0, canvas.width, canvas.height);
+                        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+                    };
+                    img.onerror = (error) => {
+                        console.error('Error loading image:', error);
+                    };
+                    img.src = URL.createObjectURL(event.data);
+                    // Clean up the URL after loading
+                    img.onload = () => {
+                        ctx.clearRect(0, 0, canvas.width, canvas.height);
+                        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+                        URL.revokeObjectURL(img.src);
+                    };
+                } else {
+                    // Handle JSON messages
+                    try {
+                        const data = JSON.parse(event.data);
+                        if (data.error) {
+                            console.error(`Stream error: ${data.error}`);
+                        } else if (data.status === 'no_frame') {
+                            console.warn('No frame received');
+                        }
+                    } catch (error) {
+                        console.error('Error parsing message:', error);
+                    }
+                }
+            } catch (error) {
+                console.error('Error processing message:', error);
+            }
         };
 
         ws.onerror = function(error) {
-            showError(cameraId, 'Stream connection error');
+            console.error(`WebSocket error for camera ${cameraId}:`, error);
         };
 
         ws.onclose = function() {
-            showError(cameraId, 'Stream connection closed');
+            console.log(`Stream closed for camera ${cameraId}`);
+            // Clear canvas when stream closes
+            ctx.fillStyle = 'black';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
         };
+
+        return ws;
     }
 
     async function removeCamera(cameraId) {
@@ -979,20 +1010,75 @@ body {
             const data = await response.json();
             
             if (response.ok) {
-                updateRecordingButtonState(button, !isRecording);
+                // Update button state based on the new recording state
+                const newRecordingState = !isRecording;
+                updateRecordingButtonState(button, newRecordingState);
                 showToast(data.message, 'success');
             } else {
                 showToast(data.message || 'Recording operation failed', 'error');
-                // Revert button state if operation failed
+                // Keep the current state if operation failed
                 updateRecordingButtonState(button, isRecording);
             }
         } catch (error) {
             console.error('Error toggling recording:', error);
             showToast('Failed to toggle recording', 'error');
-            // Revert button state on error
+            // Keep the current state on error
             updateRecordingButtonState(button, isRecording);
         } finally {
             button.disabled = false; // Re-enable button
+        }
+    }
+
+    function updateRecordingButtonState(button, isRecording) {
+        // Remove any inline styles that might interfere
+        button.style.removeProperty('background-color');
+        
+        if (isRecording) {
+            button.classList.add('recording');
+            button.innerHTML = `
+                <i class="fas fa-stop-circle"></i>
+                <span>Stop Recording</span>
+            `;
+        } else {
+            button.classList.remove('recording');
+            button.innerHTML = `
+                <i class="fas fa-circle"></i>
+                <span>Start Recording</span>
+            `;
+        }
+    }
+
+    // Update the updateRecordingStatus function as well
+    async function updateRecordingStatus(cameraId) {
+        if (!activePolling.get(cameraId)) {
+            return;
+        }
+
+        try {
+            const button = document.querySelector(`#camera-${cameraId} .btn-record`);
+            if (!button) {
+                clearAllCameraResources(cameraId);
+                return;
+            }
+
+            const response = await fetch(`/recording_status/${cameraId}`);
+            
+            if (!response.ok) {
+                if (response.status === 404) {
+                    clearAllCameraResources(cameraId);
+                }
+                return;
+            }
+
+            const data = await response.json();
+            const isRecording = data.recording_status.active_recording !== null;
+            
+            // Update button state if it doesn't match server state
+            if (isRecording !== button.classList.contains('recording')) {
+                updateRecordingButtonState(button, isRecording);
+            }
+        } catch (error) {
+            console.error('Error updating recording status:', error);
         }
     }
 
@@ -1135,63 +1221,6 @@ body {
         }, 1000);
     }
 
-    // Update updateRecordingStatus function to handle removed cameras
-    async function updateRecordingStatus(cameraId) {
-        // Check if polling is still active
-        if (!activePolling.get(cameraId)) {
-            return;
-        }
-
-        try {
-            // Check if camera still exists
-            const button = document.querySelector(`#camera-${cameraId} .btn-record`);
-            if (!button) {
-                clearAllCameraResources(cameraId);
-                return;
-            }
-
-            const response = await fetch(`/recording_status/${cameraId}`);
-            
-            // Handle 404 and other errors
-            if (!response.ok) {
-                if (response.status === 404) {
-                    clearAllCameraResources(cameraId);
-                }
-                return;
-            }
-
-            const data = await response.json();
-            const isRecording = data.recording_status.active_recording !== null;
-            
-            // Only update if button state doesn't match server state
-            if (isRecording !== button.classList.contains('recording')) {
-                updateRecordingButtonState(button, isRecording);
-            }
-        } catch (error) {
-            console.error('Error updating recording status:', error);
-            // Don't clear resources on network errors
-        }
-    }
-
-    // Add a helper function to update button state
-    function updateRecordingButtonState(button, isRecording) {
-        if (isRecording && !button.classList.contains('recording')) {
-            button.classList.add('recording');
-            button.innerHTML = `
-                <i class="fas fa-stop-circle"></i>
-                <span>Stop Recording</span>
-            `;
-            button.style.backgroundColor = 'var(--danger-color)';
-        } else if (!isRecording && button.classList.contains('recording')) {
-            button.classList.remove('recording');
-            button.innerHTML = `
-                <i class="fas fa-circle"></i>
-                <span>Start Recording</span>
-            `;
-            button.style.backgroundColor = 'var(--success-color)';
-        }
-    }
-
     // History management
     let historyVisible = false;
 
@@ -1252,33 +1281,6 @@ body {
         localStorage.removeItem('cameraHistory');
         displayHistory();
     }
-
-    function startStream(cameraId) {
-        const img = document.getElementById(`camera-${cameraId}`);
-        if (!img) return;
-
-        const ws = new WebSocket(`ws://${window.location.host}/stream/${cameraId}`);
-        
-        ws.onmessage = function(event) {
-            const blob = new Blob([event.data], {type: 'image/jpeg'});
-            img.src = URL.createObjectURL(blob);
-        };
-        
-        ws.onerror = function(error) {
-            console.error('WebSocket Error:', error);
-        };
-        
-        ws.onclose = function() {
-            console.log('Stream closed');
-            // Attempt to reconnect after 1 second
-            setTimeout(() => startStream(cameraId), 1000);
-        };
-    }
-
-    // Start streaming when camera is added
-    document.addEventListener('cameraAdded', function(e) {
-        startStream(e.detail.cameraId);
-    });
     </script>
 </body>
 </html>

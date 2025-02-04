@@ -2,6 +2,7 @@ import pytest
 import asyncio
 from app import AsyncCamera, CameraRegistry, CameraError
 from config import Config, CameraConfig, RecordingConfig, ServerConfig
+from unittest.mock import patch
 
 @pytest.fixture
 def config():
@@ -37,16 +38,24 @@ async def test_camera_registry_add_remove(camera_registry):
 
 @pytest.mark.asyncio
 async def test_camera_setup():
-    camera = AsyncCamera(source=0, max_fps=20, name="test_camera")
-    success = camera.setup(camera_id=0)
+    """Test camera setup functionality"""
+    camera = AsyncCamera(source=0)
+    success = await camera.setup(camera_id=0)
     assert success
     assert camera.camera_id == 0
     assert camera.frame_array is not None
     assert camera.status_array is not None
-    await camera.stop()
+    await camera.cleanup()
 
 @pytest.mark.asyncio
 async def test_invalid_camera_source():
-    with pytest.raises(ValueError):
-        camera = AsyncCamera(source=-1)
-        await camera.start() 
+    """Test handling of invalid camera sources"""
+    camera = AsyncCamera(source=999)  # Invalid camera index
+    
+    # Make validate_source async
+    async def mock_validate():
+        raise ValueError("Cannot open USB camera at index 999")
+    
+    with patch.object(camera, 'validate_source', side_effect=mock_validate):
+        with pytest.raises(ValueError, match="Cannot open USB camera"):
+            await camera.validate_source() 

@@ -7,8 +7,20 @@ def config():
     return Config(
         camera=CameraConfig(),
         recording=RecordingConfig(),
-        server=ServerConfig()
+        server=ServerConfig(),
+        error_emails=EmailConfig()
     )
+
+class EmailConfig:
+    def __init__(self):
+        self.enabled = False
+        self.username = ""
+        self.password = ""
+        self.recipients = []
+        self.smtp_server = "smtp.gmail.com"
+        self.smtp_port = 587
+        self.use_tls = True
+        self.sender = ""
 
 def test_default_config_values(config):
     assert config.camera.max_fps == 20
