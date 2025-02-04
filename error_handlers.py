@@ -6,7 +6,6 @@ from email.message import EmailMessage
 from config import Config
 
 logger = logging.getLogger('camera_manager')
-
 config = Config.load_from_file()
 
 class CameraError(Exception):
@@ -67,4 +66,27 @@ def send_error_email(subject, body):
             server.send_message(msg)
             
     except Exception as e:
-        logger.error(f"Failed to send error email: {str(e)}") 
+        logger.error(f"Failed to send error email: {str(e)}")
+
+def register_error_handlers(app):
+    """Register error handlers with the app"""
+    @app.errorhandler(400)
+    async def bad_request_error(e):
+        return jsonify({
+            'status': 'error',
+            'message': str(e)
+        }), 400
+
+    @app.errorhandler(404)
+    async def not_found_error(e):
+        return jsonify({
+            'status': 'error',
+            'message': str(e)
+        }), 404
+
+    @app.errorhandler(503)
+    async def service_unavailable_error(e):
+        return jsonify({
+            'status': 'error',
+            'message': str(e)
+        }), 503 

@@ -21,6 +21,14 @@ class RecordingConfig:
     quality_presets: Dict[str, Dict[str, Any]] = None
     max_storage_gb: float = 50.0
     hardware_acceleration: str = "auto"  # auto/cuda/vaapi/cpu
+    storage_path: str = 'recordings'
+    retention_days: int = 7
+    temp_dir: str = 'temp'
+    auto_cleanup: bool = True
+    cleanup_interval: int = 3600  # 1 hour
+    codec: str = 'libx264'
+    bitrate: str = '4M'
+    fps: int = 30
 
     def __post_init__(self):
         if self.quality_presets is None:
@@ -94,7 +102,15 @@ class Config:
                 'default_codec': self.recording.default_codec,
                 'quality_presets': self.recording.quality_presets,
                 'max_storage_gb': self.recording.max_storage_gb,
-                'hardware_acceleration': self.recording.hardware_acceleration
+                'hardware_acceleration': self.recording.hardware_acceleration,
+                'storage_path': self.recording.storage_path,
+                'retention_days': self.recording.retention_days,
+                'temp_dir': self.recording.temp_dir,
+                'auto_cleanup': self.recording.auto_cleanup,
+                'cleanup_interval': self.recording.cleanup_interval,
+                'codec': self.recording.codec,
+                'bitrate': self.recording.bitrate,
+                'fps': self.recording.fps
             },
             'server': {
                 'host': self.server.host,
