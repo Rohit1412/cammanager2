@@ -6,7 +6,7 @@ from utils import check_gpu_available
 
 @dataclass
 class CameraConfig:
-    max_fps: int = 20
+    max_fps: int = 30
     frame_width: int = 640
     frame_height: int = 480
     retry_attempts: int = 3
@@ -16,7 +16,7 @@ class CameraConfig:
 @dataclass
 class RecordingConfig:
     output_dir: str = 'recordings'
-    max_duration: int = 3600*24  # 24 hours
+    max_duration: int = 5 # 5 seconds
     default_codec: str = 'mp4v'
     quality_presets: Dict[str, Dict[str, Any]] = None
     max_storage_gb: float = 50.0
@@ -28,7 +28,6 @@ class RecordingConfig:
     cleanup_interval: int = 3600  # 1 hour
     codec: str = 'libx264'
     bitrate: str = '4M'
-    fps: int = 30
 
     def __post_init__(self):
         if self.quality_presets is None:

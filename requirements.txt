@@ -10,3 +10,9 @@ gunicorn==21.2.0
 pyyaml==6.0.1
 psutil==5.9.5
 ffmpeg-python==0.2.0 
+vidgear
+quart
+quart-cors
+pytest
+pytest-cov
+pytest-asyncio

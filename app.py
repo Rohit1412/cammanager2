@@ -460,19 +460,21 @@ class AsyncCamera:
     async def _recording_task(self):
         """Actual recording process with proper FFmpeg setup"""
         try:
-            # Validate FFmpeg installation
-            ffmpeg_check = await asyncio.create_subprocess_exec(
-                'ffmpeg', '-version',
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            await ffmpeg_check.wait()
-            if ffmpeg_check.returncode != 0:
-                raise RuntimeError("FFmpeg not found or not working")
-            
-            logger.info(f"Starting recording task for {self.name}")
-            
-            # FFmpeg command with proper escaping
+            # Determine target FPS from user input (if provided) or fallback to 30
+            target_fps = getattr(self, "desired_fps", 30)
+            if self.status_array is not None and len(self.status_array) > 1:
+                measured_fps = float(self.status_array[1])
+                # Use the lower of the desired FPS and measured FPS (ensuring a minimum of 15 FPS)
+                self.recording_fps = min(target_fps, measured_fps)
+                if self.recording_fps < 15:
+                    self.recording_fps = 15
+            else:
+                self.recording_fps = target_fps
+                logger.warning(f"Using fallback FPS {target_fps}, status array unavailable")
+
+            logger.info(f"Starting recording at {self.recording_fps} FPS")
+
+            # FFmpeg command with validation
             command = [
                 'ffmpeg',
                 '-y',
@@ -480,54 +482,124 @@ class AsyncCamera:
                 '-vcodec', 'rawvideo',
                 '-s', f'{self.frame_shape[1]}x{self.frame_shape[0]}',
                 '-pix_fmt', 'bgr24',
-                '-r', str(self.fps),
+                '-r', str(self.recording_fps),  # Input FPS
                 '-i', '-',
                 '-c:v', 'libx264',
                 '-preset', 'fast',
+                '-r', str(self.recording_fps),  # Output FPS
                 '-crf', '23',
                 '-pix_fmt', 'yuv420p',
                 '-movflags', 'frag_keyframe+empty_moov',
+                '-fps_mode', 'cfr',  # Enforce constant frame rate
                 self.current_recording
             ]
-            
-            # Start FFmpeg process
-            self.recording_process = await asyncio.create_subprocess_exec(
-                *command,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.PIPE
-            )
-            
-            logger.info(f"FFmpeg started for {self.name} with PID {self.recording_process.pid}")
-            
-            # Main recording loop
+
+            # Start FFmpeg with error capture
+            try:
+                self.recording_process = await asyncio.create_subprocess_exec(
+                    *command,
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.PIPE
+                )
+            except Exception as e:
+                raise RecordingError(f"FFmpeg startup failed: {str(e)}")
+
+            if not self.recording_process or not self.recording_process.stdin:
+                raise RecordingError("FFmpeg process initialization failed")
+
+            # Start stderr reader task
+            stderr_reader = asyncio.create_task(self._read_ffmpeg_errors())
+
+            # Timing control variables
+            frame_interval = 1.0 / self.recording_fps
+            last_frame_time = time.monotonic()
+            frame_counter = 0
+            start_time = last_frame_time
+
             while self.is_recording and not self._stopping:
-                frame = await self.get_frame()
-                if frame is not None:
-                    try:
-                        # Convert frame to bytes and send to FFmpeg
-                        self.recording_process.stdin.write(frame.tobytes())
-                        await self.recording_process.stdin.drain()
-                    except (BrokenPipeError, ConnectionResetError) as e:
-                        logger.error(f"FFmpeg pipe error: {str(e)}")
-                        break
-                    except Exception as e:
-                        logger.error(f"Unexpected write error: {str(e)}")
-                        break
-                    await asyncio.sleep(1/self.fps)
-                else:
-                    await asyncio.sleep(0.01)
-                
+                try:
+                    frame_start = time.monotonic()
+                    frame = await self.get_frame()
+                    
+                    if frame is None:
+                        await asyncio.sleep(0.01)
+                        continue
+
+                    # Calculate precise timing with execution time compensation
+                    elapsed = time.monotonic() - last_frame_time
+                    processing_time = time.monotonic() - frame_start
+                    sleep_time = max(0, frame_interval - elapsed - processing_time)
+                    
+                    if sleep_time > 0:
+                        await asyncio.sleep(sleep_time)
+
+                    # Write frame with timeout
+                    await asyncio.wait_for(
+                        self.recording_process.stdin.drain(),
+                        timeout=frame_interval*2
+                    )
+                    self.recording_process.stdin.write(frame.tobytes())
+                    
+                    last_frame_time = time.monotonic()
+                    frame_counter += 1
+
+                    # Log every 5 seconds
+                    if (time.monotonic() - start_time) >= 5:
+                        logger.info(f"Recording stats: {frame_counter/5:.1f} FPS")
+                        start_time = time.monotonic()
+                        frame_counter = 0
+
+                except (BrokenPipeError, ConnectionResetError) as e:
+                    logger.error(f"FFmpeg pipe error: {str(e)}")
+                    break
+                except asyncio.TimeoutError:
+                    logger.error("Frame write timeout, possible FFmpeg stall")
+                    break
+                except Exception as e:
+                    logger.error(f"Unexpected error: {str(e)}", exc_info=True)
+                    break
+
+            # Final cleanup
+            await self._finalize_recording(stderr_reader)
+
         except Exception as e:
-            logger.error(f"Recording task failed: {str(e)}")
+            logger.error(f"Recording task failed: {str(e)}", exc_info=True)
+            raise
         finally:
-            # Cleanup process
+            await self._cleanup_recording_process()
+
+    async def _read_ffmpeg_errors(self):
+        """Read and log FFmpeg stderr output"""
+        try:
+            while True:
+                line = await self.recording_process.stderr.readline()
+                if not line:
+                    break
+                logger.warning(f"FFmpeg: {line.decode().strip()}")
+        except Exception as e:
+            logger.error(f"Error reading FFmpeg output: {str(e)}")
+
+    async def _finalize_recording(self, stderr_reader):
+        """Finalize recording with proper cleanup"""
+        try:
+            if self.recording_process.stdin:
+                await self.recording_process.stdin.drain()
+                self.recording_process.stdin.close()
+            await stderr_reader
+        except Exception as e:
+            logger.error(f"Finalization error: {str(e)}")
+
+    async def _cleanup_recording_process(self):
+        """Cleanup recording process resources"""
+        try:
             if self.recording_process:
-                if self.recording_process.stdin:
-                    self.recording_process.stdin.close()
-                    await self.recording_process.stdin.wait_closed()
-                await self.recording_process.wait()
-                logger.info(f"FFmpeg exited with code {self.recording_process.returncode}")
+                exit_code = await asyncio.wait_for(self.recording_process.wait(), timeout=5)
+                logger.info(f"FFmpeg exited with code {exit_code}")
+                if exit_code != 0:
+                    logger.error(f"FFmpeg error exit code: {exit_code}")
+        except Exception as e:
+            logger.error(f"Cleanup error: {str(e)}")
 
     async def stop_recording(self):
         """Stop recording and cleanup resources"""
@@ -543,9 +615,21 @@ class AsyncCamera:
                 await self.recording_process.wait()
                 
             logger.info(f"Recording stopped: {self.current_recording}")
+
+            # Check if the recorded video file is valid (e.g. not empty)
+            if os.path.exists(self.current_recording):
+                if os.path.getsize(self.current_recording) < 1024:  # Adjust threshold as needed.
+                    error_msg = "Recording failed: video file is empty (0 sec captured)"
+                    logger.error(error_msg)
+                    return False, error_msg
+            else:
+                error_msg = "Recording failed: output file not found"
+                logger.error(error_msg)
+                return False, error_msg
+
             return True, f"Recording stopped for {self.name}"
-        except Exception as e:  # Fix exception handling
-            logger.error(f"Error stopping recording: {str(e)}")
+        except Exception as e:
+            logger.error(f"Error stopping recording: {str(e)}", exc_info=True)
             return False, str(e)
 
     async def stop(self):
@@ -1105,6 +1189,7 @@ async def index():
 @handle_camera_errors
 async def start_recording_route():
     data = await request.get_json()
+    desired_fps = int(data.get('fps', 30))
     camera_id = data.get('camera_id')
     camera = app.camera_registry.get_camera(camera_id)
     
@@ -1118,6 +1203,7 @@ async def start_recording_route():
         }), 409
 
     try:
+        camera.desired_fps = desired_fps
         success, message = await camera.start_recording()
     except AttributeError as e:
         raise RecordingError(f"Recording setup failed: {str(e)}", 500)
